@@ -1,0 +1,9 @@
+refs/
+build/
+.gradle/
+run/
+out/
+*.class
+__pycache__/
+mcopt-pack-cache/
+dist/

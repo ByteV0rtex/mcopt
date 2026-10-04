@@ -1,0 +1,30 @@
+{
+	"required": true,
+	"package": "mcopt.metal.mixin.chunk",
+	"plugin": "mcopt.metal.mixin.chunk.ChunkMixinPlugin",
+	"compatibilityLevel": "JAVA_25",
+	"client": [
+		"RegionFileStorageMixin",
+		"LevelSliceAirMixin",
+		"LevelSliceBoundsMixin",
+		"BitArrayAccessor",
+		"DirectionalVisGraphMixin",
+		"BlockRendererMixin",
+		"ClonedChunkSectionCacheMixin",
+		"ClonedChunkSectionCacheCleanupMixin",
+		"PalettedContainerFactoryMixin",
+		"LevelBiomeSliceMixin",
+		"AcquirePoiMixin",
+		"PoiSectionAccessor",
+		"SectionStorageAccess",
+		"ServerLevelTickMixin",
+		"LevelRandAccessor",
+		"DataLayerStorageMapMixin",
+		"BlockLightMapMixin",
+		"SkyLightMapMixin",
+		"ChunkAccessSectionMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}
