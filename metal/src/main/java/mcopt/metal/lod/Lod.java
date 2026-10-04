@@ -99,6 +99,9 @@ public final class Lod {
 	private long statCpuNanos;
 	/** -Dmcopt.lod.stats: render-thread nanos by part since the last stats line: field results, field update, mask, mesh installs. */
 	private final long[] partNanos = new long[4];
+	/** updateMaskDrawn's parts (stats): the render lists' walk, the cell loop, the mask's changes, the nearest far chunk; builtColumn and heightmap calls. */
+	private final long[] maskNanos = new long[4];
+	private long maskBuilt, maskHeights, maskBuiltNanos, maskMax;
 	private int lastColumns, lastR0, lastR1;
 
 	private Lod(Object encoder) {
@@ -128,6 +131,9 @@ public final class Lod {
 			if (LodMesh.DISSOLVE_MS > 0) src = "#define SEAM_DISSOLVE_MS " + LodMesh.DISSOLVE_MS + "\n" + src;
 			// -Dmcopt.lod.thin=true: steps shaded by pixel coverage (columns.metal seamThin): less shimmer under motion
 			if (LodTaa.ON) src = "#define SEAM_TAA 1\n" + src;
+			// -Dmcopt.lod.handoffPush=K (e.g. 0.9995): far terrain's depth scaled by K (pushed back by 1/K of its distance), so where a
+			// chunk is drawn by both for the frames before its hand-off, the real terrain wins the coplanar tops instead of z-fighting
+			if (HANDOFF_PUSH > 0 && HANDOFF_PUSH < 1) src = "#define SEAM_DEPTH_PUSH " + HANDOFF_PUSH + "\n" + src;
 			if (LodTaaTile.CODES) src = "#define SEAM_TAA_TILE 1\n" + src;
 			if (Boolean.getBoolean("mcopt.lod.thinTex")) src = "#define SEAM_THIN_TEX 1\n" + src;
 			if (Boolean.getBoolean("mcopt.lod.thin")) src = "#define SEAM_THIN 1\n#define SEAM_CROWN_LEVELS " + Math.max(1, LodConfig.CROWN_LEVELS) + "\n" + src;
@@ -363,6 +369,8 @@ public final class Lod {
 		Path root = LodConfig.CACHE_DIR != null ? Path.of(LodConfig.CACHE_DIR) : mc.gameDirectory.toPath().resolve("mcopt-lod");
 		String save = server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize().getFileName().toString();
 		Path cache = root.resolve(save).resolve(level.dimension().identifier().getNamespace() + "_" + level.dimension().identifier().getPath());
+		// tiles cached under other crown or tree levels lack (or carry) data these levels need: their own directory
+		if (LodConfig.CROWN_LEVELS != 1 || LodConfig.TREE_LEVELS != 1) cache = cache.resolve("c" + LodConfig.CROWN_LEVELS + "t" + LodConfig.TREE_LEVELS);
 		this.clip = new LodClip(this.ctx, LodConfig.N, LodConfig.reachBlocks());
 		if (LodConfig.MESH) this.mesh = new LodMesh(this.ctx, this.clip);
 		if (this.mesh != null && LodPk.ENABLED) {
@@ -455,8 +463,10 @@ public final class Lod {
 					pk.prepare(this.viewProj, this.camX, this.camY, this.camZ, LodConfig.reachBlocks(), this.forward.x, this.forward.z,
 						this.maskOn ? rd * 16.0F + 48.0F : 0);
 					pk.frameFields(mesh.frame, this.camX, this.camZ);
+					long pkBufs = pk.bufs(table, mesh.arena(), maskBuf, mesh, clip);
+					pk.prune(this.lod, enc, mesh.frame, LodMesh.FRAME_BYTES, this.compFrame, COMP_FRAME_BYTES, pkBufs);
 					LodNative.pkCull(this.lod, enc, mesh.frame, LodMesh.FRAME_BYTES, this.compFrame, COMP_FRAME_BYTES, pk.params, LodPk.PARAMS_BYTES,
-						pk.bufs(table, mesh.arena(), maskBuf, mesh, clip), pk.rebuilding(), pk.liveNow ? 2 : 1, mesh.blocks());
+						pkBufs, pk.rebuilding(), pk.liveNow ? 2 : 1, mesh.blocks());
 					pk.encoded(this.camX, this.camY, this.camZ);
 				} else {
 					LodNative.meshCull(this.lod, enc, mesh.frame, LodMesh.FRAME_BYTES, this.compFrame, COMP_FRAME_BYTES, table, mesh.arena(), maskBuf, mesh.argsBuf,
@@ -913,6 +923,31 @@ public final class Lod {
 	/** The chunks whose bit changed between the old mask and the new one (absolute chunk coordinates), to the position-keyed lists. */
 	private void maskChanges(LodPk pk, int @Nullable [] old, int oldX, int oldZ, int oldSize, int oldWords) {
 		if (old == null) return;
+		if (MASK_FAST && oldX == this.maskX && oldZ == this.maskZ && oldSize == this.maskSize && oldWords == this.maskWords) {
+			// same window: the changed bits word by word, in the same order (rows, then x up)
+			if (MASK_VERIFY) {
+				int slow = 0, fast = 0;
+				for (int mz = 0; mz < this.maskSize; mz++) {
+					for (int mx = 0; mx < this.maskSize; mx++) {
+						if (bit(old, mx, mz, oldSize, oldWords) != bit(this.mask, mx, mz, this.maskSize, this.maskWords)) slow++;
+					}
+				}
+				for (int k = 0; k < this.maskSize * this.maskWords; k++) fast += Integer.bitCount(old[k] ^ this.mask[k]);
+				this.verifyCells++;
+				if (slow != fast) this.verifyDiffs++;
+			}
+			for (int mz = 0; mz < this.maskSize; mz++) {
+				for (int w = 0; w < this.maskWords; w++) {
+					int k = mz * this.maskWords + w, x = old[k] ^ this.mask[k];
+					while (x != 0) {
+						int mx = w * 32 + Integer.numberOfTrailingZeros(x);
+						x &= x - 1;
+						if (mx < this.maskSize) pk.chunkChanged(this.maskX + mx, this.maskZ + mz);
+					}
+				}
+			}
+			return;
+		}
 		int x0 = Math.min(oldX, this.maskX), z0 = Math.min(oldZ, this.maskZ);
 		int x1 = Math.max(oldX + oldSize, this.maskX + this.maskSize), z1 = Math.max(oldZ + oldSize, this.maskZ + this.maskSize);
 		for (int cz = z0; cz < z1; cz++) {
@@ -959,6 +994,108 @@ public final class Lod {
 		}
 	}
 
+	/**
+	 * -Dmcopt.lod.maskFast=false: the hand-off mask's bookkeeping as before (default true: the same bits, cheaper): the render
+	 * lists' regions whose chunks are all handed off already are not walked (their sections are only read for chunks not yet
+	 * handed off), the mask's changes are diffed word by word when the window hasn't moved, and no per-frame array copies.
+	 * -Dmcopt.lod.maskVerify=true walks everything as well and counts any difference where it's read.
+	 */
+	private static final boolean MASK_FAST = !"false".equals(System.getProperty("mcopt.lod.maskFast"));
+	private static final boolean MASK_VERIFY = Boolean.getBoolean("mcopt.lod.maskVerify");
+	/** -Dmcopt.lod.handoffPush=K: far terrain's clip depth times K (see source()); 0: off. */
+	static final float HANDOFF_PUSH = Float.parseFloat(System.getProperty("mcopt.lod.handoffPush", LodConfig.SMALL ? "0.9995" : "0"));
+	/**
+	 * -Dmcopt.lod.maskSpread=true (opt-in: not frame-identical): the deep chunks' "still built" re-check (every
+	 * 64 frames) spread over the 64 frames by position instead of all in one frame (~700 Sodium lookups at once: a 0.2-0.9 ms
+	 * render-thread frame every 64 at 5K, RD 16). Same rate per chunk; which frame a given chunk is re-checked on differs.
+	 */
+	private static final boolean MASK_SPREAD = Boolean.getBoolean("mcopt.lod.maskSpread");
+	private final int[] maskPrev = new int[MASK_MAX * MASK_MAX / 32];
+	private final boolean[] handedPrev = new boolean[MASK_MAX * MASK_MAX];
+	/** Per region footprint (8 x 8 chunks, from the window's corner - 8): 0 not asked yet this walk, 1 needed, 2 not. */
+	private final byte[] regionNeed = new byte[(MASK_MAX / 8 + 2) * (MASK_MAX / 8 + 2)];
+	private long verifyCells, verifyDiffs;
+
+	private static int[] copyInto(int[] src, int[] dst) {
+		System.arraycopy(src, 0, dst, 0, src.length);
+		return dst;
+	}
+
+	private static boolean[] copyInto(boolean[] src, boolean[] dst) {
+		System.arraycopy(src, 0, dst, 0, src.length);
+		return dst;
+	}
+
+	/** The cell's listed sections are read this frame: in the render distance (the loop's own test) and not handed off. */
+	private boolean cellRead(int mx, int mz, double max2) {
+		if (this.handed[mz * MASK_MAX + mx]) return false;
+		int oz = (this.readyZ + mz) * 16, ox = (this.readyX + mx) * 16;
+		double dz = Math.max(0, Math.max(oz - 1 - this.camZ, this.camZ - (oz + 17)));
+		double dx = Math.max(0, Math.max(ox - 1 - this.camX, this.camX - (ox + 17)));
+		return dx * dx + dz * dz < max2;
+	}
+
+	/** Whether any chunk of the region at window offset (rx, rz) has its listed sections read this frame. */
+	private boolean regionNeeded(int rx, int rz, int size, double max2) {
+		int ix = (rx + 8) >> 3, iz = (rz + 8) >> 3, n = MASK_MAX / 8 + 2;
+		if (ix < 0 || iz < 0 || ix >= n || iz >= n) return false;
+		int m = iz * n + ix;
+		if (this.regionNeed[m] != 0) return this.regionNeed[m] == 1;
+		boolean need = false;
+		for (int mz = Math.max(0, rz); mz < Math.min(size, rz + 8) && !need; mz++) {
+			for (int mx = Math.max(0, rx); mx < Math.min(size, rx + 8); mx++) {
+				if (this.cellRead(mx, mz, max2)) {
+					need = true;
+					break;
+				}
+			}
+		}
+		this.regionNeed[m] = (byte) (need ? 1 : 2);
+		return need;
+	}
+
+	private final boolean[] listedRef = MASK_VERIFY ? new boolean[MASK_MAX * MASK_MAX] : new boolean[0];
+	private final long[] listedSectionsRef = MASK_VERIFY ? new long[MASK_MAX * MASK_MAX] : new long[0];
+
+	/** Sodium's render lists into listed / sections (window cells), skipping regions nothing reads when skip is set. */
+	private void walkLists(net.caffeinemc.mods.sodium.client.render.chunk.RenderSectionManager rsm, int mx0, int mz0, int size, int minSy,
+		double max2, boolean skip, boolean[] listed, long[] sections) {
+		var lists = rsm.getRenderLists().iterator(false);
+		while (lists.hasNext()) {
+			var list = lists.next();
+			var region = list.getRegion();
+			// a region whose chunks (in the window and the render distance) are all handed off: nothing here is read
+			if (skip && !this.regionNeeded(region.getChunkX() - mx0, region.getChunkZ() - mz0, size, max2)) continue;
+			var it = list.sectionsWithGeometryIterator(false);
+			if (it == null) continue;
+			while (it.hasNext()) {
+				int i = it.nextByteAsInt();
+				int mx = region.getChunkX() + (i >> 5 & 7) - mx0, mz = region.getChunkZ() + (i >> 2 & 7) - mz0;
+				if (mx >= 0 && mz >= 0 && mx < size && mz < size) {
+					listed[mz * MASK_MAX + mx] = true;
+					int sy = region.getChunkY() + (i & 3) - minSy;
+					if (sy >= 0 && sy < 64) sections[mz * MASK_MAX + mx] |= 1L << sy;
+				}
+			}
+		}
+	}
+
+	/** -Dmcopt.lod.maskVerify: the full walk as well, compared with the walk just done on every cell that's read. */
+	private void verifyWalk(net.caffeinemc.mods.sodium.client.render.chunk.RenderSectionManager rsm, int mx0, int mz0, int size, int minSy, double max2) {
+		java.util.Arrays.fill(this.listedRef, false);
+		java.util.Arrays.fill(this.listedSectionsRef, 0L);
+		this.walkLists(rsm, mx0, mz0, size, minSy, max2, false, this.listedRef, this.listedSectionsRef);
+		for (int mz = 0; mz < size; mz++) {
+			for (int mx = 0; mx < size; mx++) {
+				if (!this.cellRead(mx, mz, max2)) continue;
+				int k = mz * MASK_MAX + mx;
+				this.verifyCells++;
+				if (this.listed[k] != this.listedRef[k] || this.listedSections[k] != this.listedSectionsRef[k]) this.verifyDiffs++;
+			}
+		}
+		if (this.frames % 600 == 0) System.out.printf("mcopt-lod: mask verify: %d cells read, %d differ%n", this.verifyCells, this.verifyDiffs);
+	}
+
 	private void updateMaskDrawn(Minecraft mc, int rd) {
 		ClientLevel level = mc.level;
 		SodiumWorldRenderer sodium = SodiumWorldRenderer.instanceNullable();
@@ -967,7 +1104,7 @@ public final class Lod {
 		int ccx = (int) Math.floor(this.camX) >> 4, ccz = (int) Math.floor(this.camZ) >> 4;
 		int mx0 = ccx - size / 2, mz0 = ccz - size / 2;
 		if (mx0 != this.readyX || mz0 != this.readyZ || size != this.readySize) {
-			boolean[] old = this.handed.clone();
+			boolean[] old = MASK_FAST ? copyInto(this.handed, this.handedPrev) : this.handed.clone();
 			int dx = mx0 - this.readyX, dz = mz0 - this.readyZ;
 			java.util.Arrays.fill(this.handed, false);
 			java.util.Arrays.fill(this.listedRun, (byte) 0);
@@ -987,38 +1124,33 @@ public final class Lod {
 		}
 		// what Sodium draws this frame (its render lists are this frame's by the end of the opaque phase)
 		// (walked every other frame: a hand-off waits for 2 walks that list the surface section, i.e. 2-4 frames)
+		long m0 = System.nanoTime();
 		boolean walk = (this.frames & 1) == 0;
 		int minSy = level.getMinSectionY();
-		if (walk) {
+		if (walk && MASK_FAST) {
+			// only the window's own columns of each row are ever read
+			for (int mz = 0; mz < size; mz++) {
+				java.util.Arrays.fill(this.listed, mz * MASK_MAX, mz * MASK_MAX + size, false);
+				java.util.Arrays.fill(this.listedSections, mz * MASK_MAX, mz * MASK_MAX + size, 0L);
+			}
+		} else if (walk) {
 			java.util.Arrays.fill(this.listed, 0, size * MASK_MAX, false);
 			java.util.Arrays.fill(this.listedSections, 0, size * MASK_MAX, 0L);
 		}
+		double max = rd * 16.0, max2 = max * max;
 		if (walk) try {
 			var rsm = (net.caffeinemc.mods.sodium.client.render.chunk.RenderSectionManager) SODIUM_RSM.get(sodium);
-			var lists = rsm.getRenderLists().iterator(false);
-			while (lists.hasNext()) {
-				var list = lists.next();
-				var region = list.getRegion();
-				var it = list.sectionsWithGeometryIterator(false);
-				if (it == null) continue;
-				while (it.hasNext()) {
-					int i = it.nextByteAsInt();
-					int mx = region.getChunkX() + (i >> 5 & 7) - mx0, mz = region.getChunkZ() + (i >> 2 & 7) - mz0;
-					if (mx >= 0 && mz >= 0 && mx < size && mz < size) {
-						this.listed[mz * MASK_MAX + mx] = true;
-						int sy = region.getChunkY() + (i & 3) - minSy;
-						if (sy >= 0 && sy < 64) this.listedSections[mz * MASK_MAX + mx] |= 1L << sy;
-					}
-				}
-			}
+			if (MASK_FAST) java.util.Arrays.fill(this.regionNeed, (byte) 0);
+			this.walkLists(rsm, mx0, mz0, size, minSy, max2, MASK_FAST, this.listed, this.listedSections);
+			if (MASK_VERIFY) this.verifyWalk(rsm, mx0, mz0, size, minSy, max2);
 		} catch (ReflectiveOperationException | RuntimeException e) {
 			return;
 		}
-		double max = rd * 16.0, max2 = max * max;
+		long m1 = System.nanoTime();
 		int inner = Math.max(0, rd - 3);
 		boolean full = this.frames % 64 == 1;
 		LodPk pk = this.pk;
-		int[] oldMask = pk != null && this.maskOn ? this.mask.clone() : null;
+		int[] oldMask = pk != null && this.maskOn ? (MASK_FAST ? copyInto(this.mask, this.maskPrev) : this.mask.clone()) : null;
 		int oldX = this.maskX, oldZ = this.maskZ, oldSize = this.maskSize, oldWords = this.maskWords;
 		this.maskX = mx0;
 		this.maskZ = mz0;
@@ -1041,16 +1173,22 @@ public final class Lod {
 				// the chunk's surface section itself drawn this frame (a chunk can be listed by a lower section first)
 				if (!this.handed[k] && walk) {
 					LevelChunk ch = this.listed[k] ? level.getChunkSource().getChunk(cx, cz, false) : null;
+					if (ch != null) this.maskHeights++;
 					int sy = ch == null ? -1 : ((ch.getHeight(Heightmap.Types.WORLD_SURFACE, 8, 8) - 1) >> 4) - minSy;
 					boolean surface = sy >= 0 && sy < 64 && (this.listedSections[k] >>> sy & 1L) != 0;
 					this.listedRun[k] = (byte) (surface ? Math.min(100, this.listedRun[k] + 1) : 0);
 				}
 				boolean deep = Math.max(Math.abs(cx - ccx), Math.abs(cz - ccz)) <= inner;
-				if (this.handed[k] && (deep ? !full : (this.frames + k) % 16 != 0)) {
+				if (this.handed[k] && (deep ? (MASK_SPREAD ? (this.frames + k) % 64 != 1 : !full) : (this.frames + k) % 16 != 0)) {
 					// handed: built stays built (checked again every 16 frames in the outer ring, 64 deep inside; an unload
 					// clears it at once, see unloaded)
 				} else if (this.handed[k] || this.listedRun[k] >= HANDOFF_FRAMES) {
+					long b0 = LodConfig.STATS ? System.nanoTime() : 0;
 					this.handed[k] = this.builtColumn(level, sodium, cx, cz);
+					if (LodConfig.STATS) {
+						this.maskBuiltNanos += System.nanoTime() - b0;
+						this.maskBuilt++;
+					}
 				}
 				if (this.handed[k]) {
 					int bit = mz * this.maskWords * 32 + mx;
@@ -1059,7 +1197,9 @@ public final class Lod {
 			}
 		}
 		this.maskOn = true;
+		long m2 = System.nanoTime();
 		if (pk != null) this.maskChanges(pk, oldMask, oldX, oldZ, oldSize, oldWords);
+		long m3 = System.nanoTime();
 		double near = (size / 2 - 1) * 16.0;
 		for (int mz = 0; mz < size; mz++) {
 			int oz = (mz0 + mz) * 16;
@@ -1074,6 +1214,12 @@ public final class Lod {
 			}
 		}
 		this.nearestFar = near;
+		long m4 = System.nanoTime();
+		this.maskNanos[0] += m1 - m0;
+		this.maskNanos[1] += m2 - m1;
+		this.maskNanos[2] += m3 - m2;
+		this.maskNanos[3] += m4 - m3;
+		this.maskMax = Math.max(this.maskMax, m4 - m0);
 	}
 
 	/** Every section of the chunk from its surface (at its middle) up to its highest filled one is built by Sodium. */
@@ -1167,11 +1313,20 @@ public final class Lod {
 		System.out.printf("mcopt-lod stats: parts ms/frame results %.4f update %.4f mask %.4f installs %.4f%n", this.partNanos[0] / 1e6 / this.statFrames,
 			this.partNanos[1] / 1e6 / this.statFrames, this.partNanos[2] / 1e6 / this.statFrames, this.partNanos[3] / 1e6 / this.statFrames);
 		java.util.Arrays.fill(this.partNanos, 0);
+		if (HANDOFF_DRAWN) {
+			System.out.printf("mcopt-lod stats: mask ms/frame walk %.4f cells %.4f changes %.4f nearest %.4f, builtColumn %.1f heights %.1f a frame, builtColumn ms/frame %.4f, worst frame %.3f ms%n",
+				this.maskNanos[0] / 1e6 / this.statFrames, this.maskNanos[1] / 1e6 / this.statFrames, this.maskNanos[2] / 1e6 / this.statFrames,
+				this.maskNanos[3] / 1e6 / this.statFrames, (double) this.maskBuilt / this.statFrames, (double) this.maskHeights / this.statFrames,
+				this.maskBuiltNanos / 1e6 / this.statFrames, this.maskMax / 1e6);
+			java.util.Arrays.fill(this.maskNanos, 0);
+			this.maskBuilt = this.maskHeights = this.maskBuiltNanos = this.maskMax = 0;
+		}
 		System.out.printf("mcopt-lod stats: %d fps, cpu %.3f ms/frame, columns %d, band rows %d..%d, tiles needed %d missing %d, generated %d (%.1f ms avg), "
-				+ "loaded %d, pending %d, queued %d, chunks %d, nearest far %.0f, settled %s%n",
+				+ "loaded %d, pending %d, queued %d, chunks %d, nearest far %.0f, settled %s%s%n",
 			this.statFrames, this.statCpuNanos / 1e6 / this.statFrames, this.lastColumns, this.lastR0, this.lastR1, w.needed, w.missing, w.generated.get(),
 			w.generated.get() == 0 ? 0 : w.genNanos.get() / 1e6 / w.generated.get(), w.loaded.get(), w.pendingJobs(), w.queued(), w.chunksSummarized.get(),
-			this.nearestFar, w.settled ? String.format("%.1fs", (w.settledNanos - w.startNanos) / 1e9) : "no");
+			this.nearestFar, w.settled ? String.format("%.1fs", (w.settledNanos - w.startNanos) / 1e9) : "no",
+			LodField.CHUNK_TILES ? String.format(", chunk tiles %d (generations skipped %d)", w.chunkTiles.get(), w.chunkSkipped.get()) : "");
 		StringBuilder gen = new StringBuilder();
 		for (int i = 0; i < 16; i++) {
 			long n = w.noise.stageNanos.get(i * 4 + 3);
@@ -1190,9 +1345,10 @@ public final class Lod {
 		if (pk != null) {
 			System.out.printf("mcopt-lod stats: pk %d frames (+%d fast: full cull, %d switches), %d with stale sectors in view (%d sectors drawn live; stale in view:"
 					+ " %d unbuilt, %d dirty, %d expired), %d sectors rebuilt (%d of the hand-off band), %d generations, %d overflows, %d mesh changes skipped (live ring, level not drawn"
-					+ " there), %d occluder drops, records %.0f MB%n",
+					+ " there), %d occluder drops, records %.0f MB, %d sectors pruned to the visible set%n",
 				pk.statFrames, pk.statFastFrames, pk.statSwitches, pk.statFallbacks, pk.statLive, pk.statUnbuilt, pk.statDirty, pk.statExpired, pk.statRebuilt,
-				pk.statRebuiltNear, pk.statGenerations, pk.statOverflows, pk.statSkipped, pk.statOccDrops, pk.recordsMb());
+				pk.statRebuiltNear, pk.statGenerations, pk.statOverflows, pk.statSkipped, pk.statOccDrops, pk.recordsMb(), pk.statVisPruned);
+			pk.statVisPruned = 0;
 			if (LodPk.LOAD) System.out.println("mcopt-lod stats: pk " + pk.loadState());
 			this.pkSwitches += pk.statSwitches;
 			pk.statOccDrops = 0;
@@ -1336,6 +1492,10 @@ public final class Lod {
 		m.put("threads", LodConfig.THREADS);
 		m.put("firstSettleSeconds", w.firstSettledNanos == 0 ? null : (w.firstSettledNanos - w.startNanos) / 1e9);
 		m.put("chunksSummarized", w.chunksSummarized.get());
+		if (LodField.CHUNK_TILES) {
+			m.put("chunkTiles", w.chunkTiles.get());
+			m.put("chunkSkipped", w.chunkSkipped.get());
+		}
 		m.put("snapshotUs", w.snapshots == 0 ? 0 : w.snapNanos / 1e3 / w.snapshots);
 		m.put("blockEdits", l.statEdits);
 		m.put("resnapshots", l.statResnapshots);

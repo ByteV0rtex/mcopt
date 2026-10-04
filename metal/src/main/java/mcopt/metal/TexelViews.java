@@ -13,6 +13,8 @@ import java.util.Map;
  */
 final class TexelViews {
 	static final boolean ON = Boolean.getBoolean("mcopt.cpu.texelCache");
+	/** Per-frame switch for the same-run picture check (AbShots); always true otherwise. */
+	static volatile boolean active = true;
 	private static final int KEEP_SUBMITS = 3;
 
 	private record Key(MetalBuffer buffer, long memory, long offset, long length, int format) {

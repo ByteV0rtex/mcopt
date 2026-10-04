@@ -51,6 +51,17 @@ final class LodField {
 
 	// stats
 	final AtomicLong generated = new AtomicLong(), loaded = new AtomicLong(), genNanos = new AtomicLong(), chunksSummarized = new AtomicLong();
+	/** -Dmcopt.lod.chunkTiles: level-0 tiles built from the game's chunks alone, generations skipped because of them. */
+	final AtomicLong chunkTiles = new AtomicLong(), chunkSkipped = new AtomicLong();
+	/**
+	 * -Dmcopt.lod.chunkTiles=true: a level-0 tile not yet generated whose 16 chunks the client already has is built from those
+	 * chunks alone, and its generation is skipped. The words are what generation followed by the chunks would leave (the chunks
+	 * write every level-0 column), sooner and without the noise: in a flight the tiles under the render distance stop
+	 * competing with the ones ahead.
+	 */
+	static final boolean CHUNK_TILES = Boolean.getBoolean("mcopt.lod.chunkTiles");
+	/** Level-0 tiles built from chunks (render thread adds; workers read). */
+	private final java.util.Set<Long> chunkBuilt = java.util.concurrent.ConcurrentHashMap.newKeySet();
 	/** Render thread: chunks snapshotted and the time it took (ns). */
 	long snapshots, snapNanos;
 	long startNanos = System.nanoTime(), settledNanos, firstSettledNanos;
@@ -129,6 +140,16 @@ final class LodField {
 			return;
 		}
 		int level = LodTile.levelOf(key), tx = LodTile.txOf(key), tz = LodTile.tzOf(key);
+		if (CHUNK_TILES && level == 0 && this.chunkBuilt.contains(key)) {
+			// built from the game's chunks meanwhile (the render thread checks again before anything is put)
+			this.chunkSkipped.incrementAndGet();
+			this.results.add(() -> {
+				this.pending.remove(key);
+				// evicted since: the next scan asks for it again, and then it's generated
+				if (!this.clip.resident(0, tx, tz)) this.chunkBuilt.remove(key);
+			});
+			return;
+		}
 		int[] g = new int[LodTile.CELLS], c = new int[LodTile.CELLS];
 		int[] cr = level < this.clip.crownLevels ? new int[LodTile.CELLS] : null;
 		int[] tw = level == 0 && LodConfig.TEXTURES ? new int[LodTile.CELLS] : null;
@@ -158,6 +179,10 @@ final class LodField {
 		}
 		this.results.add(() -> {
 			this.pending.remove(key);
+			if (CHUNK_TILES && level == 0 && this.chunkBuilt.contains(key)) {
+				if (this.clip.resident(0, tx, tz)) return;
+				this.chunkBuilt.remove(key);
+			}
 			if (this.clip.put(level, tx, tz, g, c, cr, tw, rn, pl) && level == 0) {
 				List<LodChunks.Summary> real = this.waiting.remove(key);
 				if (real != null) for (LodChunks.Summary s : real) this.applyChunk(s);
@@ -345,6 +370,7 @@ final class LodField {
 					List<LodChunks.Summary> list = this.waiting.computeIfAbsent(LodTile.key(0, tx, tz), k -> new ArrayList<>());
 					list.removeIf(o -> o.chunkX() == s.chunkX() && o.chunkZ() == s.chunkZ());
 					list.add(s);
+					if (CHUNK_TILES && list.size() == (LodTile.SIZE / 16) * (LodTile.SIZE / 16)) this.buildFromChunks(tx, tz, list);
 				}
 				continue;
 			}
@@ -378,6 +404,59 @@ final class LodField {
 			this.clip.refresh(level, tx, tz);
 			this.dirtyTiles.add(LodTile.key(level, tx, tz));
 		}
+	}
+
+	/** -Dmcopt.lod.chunkTiles: a level-0 tile from its 16 chunks' summaries, words as applyChunk writes them, in one put. */
+	private void buildFromChunks(int tx, int tz, List<LodChunks.Summary> list) {
+		long key = LodTile.key(0, tx, tz);
+		int[] g = new int[LodTile.CELLS], c = new int[LodTile.CELLS];
+		int[] cr = this.clip.crownLevels > 0 ? new int[LodTile.CELLS] : null;
+		int[] tw = LodConfig.TEXTURES ? new int[LodTile.CELLS] : null;
+		int[] rn = cr != null ? new int[LodTile.CELLS] : null;
+		int[] pl = this.clip.plants ? new int[2 * LodTile.CELLS] : null;
+		int x0 = tx * LodTile.SIZE, z0 = tz * LodTile.SIZE;
+		for (LodChunks.Summary s : list) {
+			int bx = s.chunkX() * 16, bz = s.chunkZ() * 16;
+			for (int k = 0; k < 256; k++) {
+				int i = (bz + (k >> 4) - z0) * LodTile.SIZE + (bx + (k & 15) - x0);
+				boolean wet = s.water()[k] != LodTile.DRY && s.water()[k] > s.height()[k];
+				int clear = (s.clear()[k] ? LodClip.GEOM_CLEAR : 0) | LodClip.depthBits(s.depth()[k]);
+				int surface = wet ? s.water()[k] : s.height()[k];
+				int gw, cw, crw, runs = 0, pa = 0, pb = 0;
+				if (s.crownLo()[k] > surface) {
+					gw = LodClip.crownGeomWord(s.crownHi()[k], s.crownHi()[k] - s.crownLo()[k], false) | clear;
+					cw = LodClip.colorWord(s.top()[k], s.side()[k]);
+					crw = LodClip.crownWord(surface, s.groundColor()[k]);
+					runs = s.runs()[k];
+				} else {
+					pa = s.plantA()[k];
+					pb = s.plantB()[k];
+					gw = LodClip.geomWord(Math.max(surface, s.crownHi()[k]), wet) | clear | (s.fringe()[k] && !wet ? LodClip.GEOM_FRINGE : 0)
+						| ((pa & 1023) != 0 && !wet ? LodClip.plantBits((pa >> 20 & 3) + 1) : 0);
+					cw = LodClip.colorWord(s.top()[k], s.side()[k]);
+					crw = LodClip.belowWord(s.below()[k]);
+				}
+				// as putCell masks them
+				if (pl == null) gw &= ~LodClip.GEOM_PLANT_BITS;
+				if (cr == null) gw &= ~LodClip.GEOM_CROWN_BITS;
+				g[i] = gw;
+				c[i] = cw;
+				if (cr != null) cr[i] = crw;
+				if (rn != null) rn[i] = runs;
+				if (tw != null) tw[i] = s.tex()[k];
+				if (pl != null) {
+					pl[i] = pa;
+					pl[LodTile.CELLS + i] = pb;
+				}
+			}
+		}
+		if (!this.clip.put(0, tx, tz, g, c, cr, tw, rn, pl)) return;
+		this.chunkBuilt.add(key);
+		this.waiting.remove(key);
+		this.chunkTiles.incrementAndGet();
+		this.dirtyTiles.add(key);
+		if (this.chunkBuilt.size() > 4096) this.chunkBuilt.removeIf(k -> !this.clip.resident(0, LodTile.txOf(k), LodTile.tzOf(k)));
+		this.arrived(key);
 	}
 
 	// ---- -Dmcopt.lod.verify: generated far terrain against the real chunks, column by column ----

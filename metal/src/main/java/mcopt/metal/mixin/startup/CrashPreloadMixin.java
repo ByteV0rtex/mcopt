@@ -20,5 +20,19 @@ abstract class CrashPreloadMixin {
 		Thread t = new Thread(() -> new CrashReport("Don't panic!", new Throwable()).getFriendlyReport(ReportType.CRASH), "mcopt crash-report preload");
 		t.setDaemon(true);
 		t.start();
+		// -Dmcopt.startup.crashPreloadTest=FILE (test only): a real crash report built now, on the main thread, while the preload thread
+		// may still be probing the hardware: shows a crash in the first seconds still gets the full system details.
+		String test = System.getProperty("mcopt.startup.crashPreloadTest");
+		if (test != null) {
+			try {
+				java.nio.file.Files.writeString(java.nio.file.Path.of(test),
+					new CrashReport("mcopt crash-preload test", new Throwable()).getFriendlyReport(ReportType.CRASH));
+				t.join();
+				java.nio.file.Files.writeString(java.nio.file.Path.of(test + ".after"),
+					new CrashReport("mcopt crash-preload test", new Throwable()).getFriendlyReport(ReportType.CRASH));
+			} catch (java.io.IOException | InterruptedException e) {
+				throw new RuntimeException(e);
+			}
+		}
 	}
 }

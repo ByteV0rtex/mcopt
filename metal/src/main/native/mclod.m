@@ -674,3 +674,169 @@ int mcl_pk_cull(LodCols *l, Enc *enc, const void *frame, int frameLength, const 
 #undef B
 	return 0;
 }
+
+// ---- the lists' visible set (-Dmcopt.lod.pkVis; columns.metal lod_pk_facet_*) ----
+
+// The facets' resources, grown on demand (one LodCols in practice).
+static struct {
+	id<MTLRenderPipelineState> pso;
+	id<MTLDepthStencilState> depth;
+	id<MTLTexture> dist, depthT;
+	int w, h;
+	id<MTLBuffer> surv, out, args, cnt, near, tiles;
+	int stride, tilesLen;
+} pkVis;
+
+static id<MTLTexture> pkVisTexture(Ctx *ctx, MTLPixelFormat f, int w, int h, MTLTextureUsage usage, MTLStorageMode mode) {
+	MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:f width:(NSUInteger) w height:(NSUInteger) h mipmapped:NO];
+	d.usage = usage;
+	d.storageMode = mode;
+	return [ctx->device newTextureWithDescriptor:d];
+}
+
+// Prunes the records of azimuth az's sectors in bandMask (1 the hand-off band, 2 the far band) against a depth facet: the
+// records of the azimuth and its two neighbors, both bands, of the sectors in use (use: 4 x 32-bit masks), drawn from facet
+// (a CompFrame: the facet's camera-relative viewProj, screen.xy its size fw x fh, origin and camFrac the build camera's).
+// eps0, eps1: the bands' margins (blocks). stride: max(recCap, recCap0). bufs: as mcl_pk_cull's. Encoded in the pre command
+// buffer, before the frame's cull. Returns -1 when a pipeline or a resource is missing (nothing encoded).
+int mcl_pk_vis(LodCols *l, Enc *enc, const void *frame, int frameLength, const void *facet, int facetLength, const void *params, int paramsLength,
+	const int64_t *bufs, int az, int bandMask, float eps0, float eps1, const void *use, int fw, int fh, int stride) {
+	id<MTLComputePipelineState> gather = pkPso(l, "lod_pk_facet_gather"), args = pkPso(l, "lod_pk_facet_args"), reduce = pkPso(l, "lod_pk_facet_reduce"),
+		prune = pkPso(l, "lod_pk_facet_prune"), commit = pkPso(l, "lod_pk_facet_commit");
+	if (!gather || !args || !reduce || !prune || !commit || fw <= 0 || fh <= 0 || stride <= 0) return -1;
+	Ctx *ctx = l->ctx;
+	@autoreleasepool {
+		if (!pkVis.pso) {
+			MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor new] autorelease];
+			pd.label = @"lod pk facet";
+			pd.vertexFunction = l->meshVs;
+			pd.fragmentFunction = [[l->library newFunctionWithName:@"lod_pk_facet_fs"] autorelease];
+			if (!pd.fragmentFunction) return -1;
+			pd.colorAttachments[0].pixelFormat = MTLPixelFormatR32Float;
+			pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+			NSError *e = nil;
+			pkVis.pso = [ctx->device newRenderPipelineStateWithDescriptor:pd error:&e];
+			if (!pkVis.pso) {
+				fprintf(stderr, "mcopt-lod: lod pk facet pipeline: %s\n", e ? e.description.UTF8String : "?");
+				return -1;
+			}
+			MTLDepthStencilDescriptor *dd = [[MTLDepthStencilDescriptor new] autorelease];
+			dd.depthCompareFunction = MTLCompareFunctionGreaterEqual;
+			dd.depthWriteEnabled = YES;
+			pkVis.depth = [ctx->device newDepthStencilStateWithDescriptor:dd];
+			pkVis.args = [ctx->device newBufferWithLength:128 options:MTLResourceStorageModePrivate];
+			pkVis.cnt = [ctx->device newBufferWithLength:16 options:MTLResourceStorageModePrivate];
+			pkVis.near = [ctx->device newBufferWithLength:16 options:MTLResourceStorageModePrivate];
+		}
+		if (fw > pkVis.w || fh > pkVis.h) {
+			[pkVis.dist release];
+			[pkVis.depthT release];
+			pkVis.w = fw > pkVis.w ? fw : pkVis.w;
+			pkVis.h = fh > pkVis.h ? fh : pkVis.h;
+			pkVis.dist = pkVisTexture(ctx, MTLPixelFormatR32Float, pkVis.w, pkVis.h, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead,
+				MTLStorageModePrivate);
+			pkVis.depthT = pkVisTexture(ctx, MTLPixelFormatDepth32Float, pkVis.w, pkVis.h, MTLTextureUsageRenderTarget, MTLStorageModeMemoryless);
+			int tl = ((pkVis.w + 7) / 8) * ((pkVis.h + 7) / 8) * 4;
+			if (tl > pkVis.tilesLen) {
+				[pkVis.tiles release];
+				pkVis.tiles = [ctx->device newBufferWithLength:(NSUInteger) tl options:MTLResourceStorageModePrivate];
+				pkVis.tilesLen = tl;
+			}
+		}
+		if (stride > pkVis.stride) {
+			[pkVis.surv release];
+			[pkVis.out release];
+			pkVis.surv = [ctx->device newBufferWithLength:(NSUInteger) stride * 6 * 16 options:MTLResourceStorageModePrivate];
+			pkVis.out = [ctx->device newBufferWithLength:(NSUInteger) stride * 2 * 16 options:MTLResourceStorageModePrivate];
+			pkVis.stride = stride;
+		}
+		if (!pkVis.dist || !pkVis.depthT || !pkVis.tiles || !pkVis.surv || !pkVis.out || !pkVis.args || !pkVis.cnt || !pkVis.near) return -1;
+#define B(i) ((id<MTLBuffer>) (void *) bufs[i])
+		mc_pre_end_encoders(enc);
+		id<MTLCommandBuffer> cb = mc_pre(enc);
+		id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+		b.label = @"lod pk facet reset";
+		[b fillBuffer:pkVis.args range:NSMakeRange(0, 128) value:0];
+		[b fillBuffer:pkVis.cnt range:NSMakeRange(0, 16) value:0];
+		// (0x7f7f7f7f: a float past any distance)
+		[b fillBuffer:pkVis.near range:NSMakeRange(0, 4) value:0x7f];
+		[b endEncoding];
+		uint32_t a = (uint32_t) az, cap = (uint32_t) stride * 6, sel[2] = {(uint32_t) az, (uint32_t) bandMask}, size[2] = {(uint32_t) fw, (uint32_t) fh};
+		float eps[2] = {eps0, eps1};
+		id<MTLComputeCommandEncoder> c = [cb computeCommandEncoder];
+		c.label = @"lod pk facet gather";
+		[c setBytes:params length:paramsLength atIndex:14];
+		[c setBuffer:B(11) offset:0 atIndex:15];
+		[c setBuffer:B(6) offset:0 atIndex:7];
+		[c setBuffer:pkVis.surv offset:0 atIndex:11];
+		[c setBuffer:pkVis.args offset:0 atIndex:4];
+		[c setBytes:&a length:4 atIndex:20];
+		[c setBytes:&cap length:4 atIndex:21];
+		[c setBytes:use length:16 atIndex:9];
+		[c setComputePipelineState:gather];
+		[c dispatchThreads:MTLSizeMake((NSUInteger) cap, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+		[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
+		[c setComputePipelineState:args];
+		[c dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+		[c endEncoding];
+		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+		rp.colorAttachments[0].texture = pkVis.dist;
+		rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+		rp.colorAttachments[0].clearColor = MTLClearColorMake(1e30, 0, 0, 0);
+		rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+		rp.depthAttachment.texture = pkVis.depthT;
+		rp.depthAttachment.loadAction = MTLLoadActionClear;
+		rp.depthAttachment.clearDepth = 0.0;
+		rp.depthAttachment.storeAction = MTLStoreActionDontCare;
+		id<MTLRenderCommandEncoder> r = [cb renderCommandEncoderWithDescriptor:rp];
+		r.label = @"lod pk facet";
+		[r setViewport:(MTLViewport) {0, 0, (double) fw, (double) fh, 0, 1}];
+		[r setScissorRect:(MTLScissorRect) {0, 0, (NSUInteger) fw, (NSUInteger) fh}];
+		[r setRenderPipelineState:pkVis.pso];
+		[r setDepthStencilState:pkVis.depth];
+		[r setCullMode:MTLCullModeNone];
+		[r setVertexBytes:facet length:facetLength atIndex:22];
+		[r setVertexBuffer:B(4) offset:0 atIndex:23];
+		[r setVertexBuffer:B(1) offset:0 atIndex:24];
+		[r setVertexBuffer:pkVis.args offset:0 atIndex:25];
+		[r setVertexBuffer:pkVis.surv offset:0 atIndex:26];
+		[r setVertexBuffer:B(0) offset:0 atIndex:27];
+		[r setVertexBuffer:B(9) offset:0 atIndex:28];
+		[r setVertexBuffer:B(10) offset:0 atIndex:29];
+		[r setVertexBytes:frame length:frameLength atIndex:30];
+		[r drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexType:MTLIndexTypeUInt16 indexBuffer:l->meshIdx indexBufferOffset:0 indirectBuffer:pkVis.args
+			indirectBufferOffset:0];
+		[r endEncoding];
+		c = [cb computeCommandEncoder];
+		c.label = @"lod pk facet prune";
+		[c setTexture:pkVis.dist atIndex:0];
+		[c setBuffer:pkVis.tiles offset:0 atIndex:0];
+		[c setBuffer:pkVis.near offset:0 atIndex:1];
+		[c setBytes:size length:8 atIndex:2];
+		[c setComputePipelineState:reduce];
+		[c dispatchThreads:MTLSizeMake((NSUInteger) (fw + 7) / 8, (NSUInteger) (fh + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+		[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
+		[c setBytes:facet length:facetLength atIndex:22];
+		[c setBytes:frame length:frameLength atIndex:0];
+		[c setBytes:params length:paramsLength atIndex:14];
+		[c setBuffer:B(11) offset:0 atIndex:15];
+		[c setBuffer:B(6) offset:0 atIndex:7];
+		[c setBuffer:B(12) offset:0 atIndex:16];
+		[c setBuffer:B(1) offset:0 atIndex:2];
+		[c setBuffer:B(0) offset:0 atIndex:1];
+		[c setBuffer:pkVis.tiles offset:0 atIndex:8];
+		[c setBuffer:pkVis.out offset:0 atIndex:11];
+		[c setBuffer:pkVis.cnt offset:0 atIndex:12];
+		[c setBytes:sel length:8 atIndex:20];
+		[c setBytes:eps length:8 atIndex:21];
+		[c setBuffer:pkVis.near offset:0 atIndex:9];
+		[c setComputePipelineState:prune];
+		[c dispatchThreads:MTLSizeMake((NSUInteger) stride * 2, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+		[c memoryBarrierWithScope:MTLBarrierScopeBuffers];
+		[c setComputePipelineState:commit];
+		[c dispatchThreads:MTLSizeMake((NSUInteger) stride * 2, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+		[c endEncoding];
+#undef B
+	}
+	return 0;
+}

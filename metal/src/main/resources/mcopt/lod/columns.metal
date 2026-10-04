@@ -2341,6 +2341,10 @@ struct MeshVOut {
 static inline float4 meshClip(constant CompFrame& f, float3 rel) {
     float4 clip = f.viewProj * float4(rel, 1.0);
     clip.y = -clip.y;   // the backend draws GL's orientation flipped
+#ifdef SEAM_DEPTH_PUSH
+    // (-Dmcopt.lod.handoffPush: reversed z, so a smaller z is farther; the real terrain wins a coplanar top)
+    clip.z *= SEAM_DEPTH_PUSH;
+#endif
     return clip;
 }
 
@@ -2964,7 +2968,11 @@ fragment half4 lod_mesh_vanilla(MeshVOut in [[stage_in]], constant CompFrame& f 
                                 , constant SeamTaaFrame& tf [[buffer(30)]], texture2d<half> hist [[texture(21)]]
 #endif
                                 ) {
-    if ((in.info & 7u) == 7u) return ((in.info >> 3) & 1u) != 0u ? half4(1.0h, 0.0h, 0.0h, 1.0h) : half4(0.0h, 1.0h, 0.0h, 1.0h);
+    if ((in.info & 7u) == 7u) {
+        // the debug marks: 1 red (the block cull hid it), 2 green (the quad cull), 3 blue (the lists' visible set pruned it)
+        uint m = (in.info >> 3) & 3u;
+        return m == 1u ? half4(1.0h, 0.0h, 0.0h, 1.0h) : m == 2u ? half4(0.0h, 1.0h, 0.0h, 1.0h) : half4(0.0h, 0.0h, 1.0h, 1.0h);
+    }
     CompSurface s;
     uint record;
     meshSurface(f, in.position, in.info, geom, color, crowns, s, record);
@@ -3599,4 +3607,153 @@ kernel void lod_pk_finish(constant MeshFrame& f [[buffer(0)]], device uint* args
     args[0] = MESH_DRAW_Q * 6u;
     args[1] = (n + MESH_DRAW_Q - 1u) / MESH_DRAW_Q;
     args[6] = min(args[6], uint(f.counts.w));
+}
+
+// ---- the lists' visible set (opus #1 on the lists): a depth facet per azimuth sector ----
+//
+// After a sector is rebuilt, the far terrain it and its two azimuth neighbors hold is drawn depth-only into a facet: a
+// narrow perspective view from the build camera along the sector (CompFrame f with its own viewProj and screen). Each
+// tile of 8 x 8 texels keeps its farthest surface. A record of the sector is kept only if some tile under its footprint
+// (grown for any camera within the margin) has a surface at or past the record's nearest point: else every ray to it
+// ends nearer. Records only shrink, so a sector stays a superset of what shows.
+
+#define PK_FACET_TILE 8
+
+// The facet's records: azimuth a's and its neighbors', both bands, of the sectors in use (built, their blocks unchanged
+// since), as survivors (lod_mesh_vs2 draws them).
+kernel void lod_pk_facet_gather(constant PkParams& pk [[buffer(14)]], device const uint* sec [[buffer(15)]], device const uint4* recs [[buffer(7)]],
+                                device uint4* out [[buffer(11)]], device atomic_uint* args [[buffer(4)]], constant uint& az [[buffer(20)]],
+                                constant uint& cap [[buffer(21)]], constant uint4& use [[buffer(9)]], uint gid [[thread_position_in_grid]]) {
+    // 6 sectors, each up to its record capacity: gid walks them (sector k = gid / stride)
+    uint stride = max(pk.recCap, pk.recCap0);
+    uint k = gid / stride, i = gid % stride;
+    if (k >= 6u) return;
+    uint a = (az + uint(PK_AZ) + (k % 3u) - 1u) % uint(PK_AZ), s = a + (k / 3u) * uint(PK_AZ);
+    if (!pkHas4(use, int(s))) return;
+    uint n = min(sec[s * PK_SECTOR_WORDS], pkRecCap(pk, s));
+    if (i >= n) return;
+    uint4 r = recs[pkRecBase(pk, s) + i];
+    // (mark mode keeps pruned records, marked 3: they don't occlude, as if gone)
+    if (((r.w >> 25) & 3u) == 3u) return;
+    uint at = atomic_fetch_add_explicit(&args[ARGS_SURV], 1u, memory_order_relaxed);
+    if (at < cap) out[at] = r;
+}
+
+kernel void lod_pk_facet_args(device uint* args [[buffer(4)]], constant uint& cap [[buffer(21)]], uint gid [[thread_position_in_grid]]) {
+    if (gid != 0u) return;
+    uint n = min(args[ARGS_SURV], cap);
+    args[ARGS_SURV] = n;
+    args[0] = MESH_DRAW_Q * 6u;
+    args[1] = (n + MESH_DRAW_Q - 1u) / MESH_DRAW_Q;
+    args[2] = 0u;
+    args[3] = 0u;
+    args[4] = 0u;
+}
+
+// The facet's surface distance (the view axis' depth) where it is nearest.
+fragment float lod_pk_facet_fs(MeshVOut in [[stage_in]]) {
+    return 1.0 / in.position.w;
+}
+
+// Per tile, the farthest surface (no surface: the clear value, far past everything); in near[0] (as uint bits, positive
+// floats order as uints; the caller starts it at FLT_MAX) the nearest surface in the whole facet.
+kernel void lod_pk_facet_reduce(texture2d<float, access::read> dist [[texture(0)]], device float* tiles [[buffer(0)]], device atomic_uint* near [[buffer(1)]],
+                                constant uint2& size [[buffer(2)]], uint2 gid [[thread_position_in_grid]]) {
+    // (size: the facet's, in the corner of a texture that may be larger)
+    uint tw = (size.x + PK_FACET_TILE - 1u) / PK_FACET_TILE, th = (size.y + PK_FACET_TILE - 1u) / PK_FACET_TILE;
+    if (gid.x >= tw || gid.y >= th) return;
+    float m = 0.0, n = FLT_MAX;
+    for (uint y = 0u; y < uint(PK_FACET_TILE); y++)
+        for (uint x = 0u; x < uint(PK_FACET_TILE); x++) {
+            uint2 p = uint2(gid.x * PK_FACET_TILE + x, gid.y * PK_FACET_TILE + y);
+            if (p.x < size.x && p.y < size.y) {
+                float d = dist.read(p).r;
+                m = max(m, d);
+                n = min(n, d);
+            }
+        }
+    tiles[gid.y * tw + gid.x] = m;
+    atomic_fetch_min_explicit(near, as_type<uint>(n), memory_order_relaxed);
+}
+
+// The sectors' records (azimuth sel.x, the bands in mask sel.y) against the facet's tiles: the kept ones into out (band k's
+// at k * stride), counted in cnt[k] (cnt[2 + k]: set if the sector overflowed, and stays as it is). eps: per band, the
+// margin (blocks) its records hold for.
+kernel void lod_pk_facet_prune(constant CompFrame& f [[buffer(22)]], constant MeshFrame& mf [[buffer(0)]], constant PkParams& pk [[buffer(14)]],
+                               device const uint* sec [[buffer(15)]], device const uint4* recs [[buffer(7)]], device const MeshInstance* stand [[buffer(16)]],
+                               device const uint* arena [[buffer(2)]], device const uint4* table [[buffer(1)]], device const float* tiles [[buffer(8)]],
+                               device uint4* out [[buffer(11)]], device atomic_uint* cnt [[buffer(12)]], constant uint2& sel [[buffer(20)]],
+                               constant float2& epsB [[buffer(21)]], device const float* near [[buffer(9)]], uint gid [[thread_position_in_grid]]) {
+    uint stride = max(pk.recCap, pk.recCap0);
+    uint k = gid / stride, i = gid % stride;
+    if (k >= 2u || ((sel.y >> k) & 1u) == 0u) return;
+    uint s = sel.x + k * uint(PK_AZ);
+    float eps = k == 0u ? epsB.x : epsB.y;
+    uint n = sec[s * PK_SECTOR_WORDS];
+    if (n > pkRecCap(pk, s)) {
+        // overflowed (the live cull draws it): left as it is
+        if (i == 0u) atomic_store_explicit(&cnt[2u + k], 1u, memory_order_relaxed);
+        return;
+    }
+    if (i >= n) return;
+    uint4 r = recs[pkRecBase(pk, s) + i];
+    float4 P[4];
+    bool keep = false;
+    if ((r.w & (1u << 24)) != 0u) {
+        // a stand-in is always kept (few; and mark mode couldn't show one pruned wrongly)
+        keep = true;
+        for (uint c = 0u; c < 4u; c++) P[c] = float4(0.0, 0.0, 0.0, 2.0);
+    } else {
+        int L = int((r.w >> 20) & 15u), tz = int(r.w << 12) >> 12;
+        for (uint c = 0u; c < 4u; c++) P[c] = meshQuadCorner(f, r.x & 0x7FFFFFFFu, r.y, int(r.z), tz, L, false, int4(0), c, 0u).position;
+    }
+    float2 lo = float2(1e30), hi = float2(-1e30);
+    float wmin = 1e30;
+    for (uint c = 0u; c < 4u && !keep; c++) {
+        if (P[c].w <= 1.0) {
+            keep = true;
+            break;
+        }
+        float2 sc = (P[c].xy / P[c].w * float2(0.5, -0.5) + 0.5) * f.screen.xy;
+        lo = min(lo, sc);
+        hi = max(hi, sc);
+        wmin = min(wmin, P[c].w);
+    }
+    if (!keep) {
+        // grown for any camera within eps: the most the record (at wmin or past) and an occluder (at the facet's nearest
+        // surface or past) turn against each other, in texels (x: the facet's focal length), and a texel
+        float g = (eps / wmin + eps / max(near[0], 1.0)) * abs(f.viewProj[0][0]) * f.screen.x * 0.5 + 1.0;
+        lo -= g;
+        hi += g;
+        if (lo.x < 0.0 || lo.y < 0.0 || hi.x >= f.screen.x || hi.y >= f.screen.y) {
+            keep = true;
+        } else {
+            uint tw = (uint(f.screen.x) + PK_FACET_TILE - 1u) / PK_FACET_TILE;
+            uint2 t0 = uint2(lo) / PK_FACET_TILE, t1 = uint2(hi) / PK_FACET_TILE;
+            float far = 0.0;
+            for (uint ty = t0.y; ty <= t1.y && far < wmin; ty++)
+                for (uint tx = t0.x; tx <= t1.x; tx++) far = max(far, tiles[ty * tw + tx]);
+            keep = far + 2.0 * eps + 0.5 >= wmin;
+        }
+    }
+    if (!keep) {
+        // mark mode (opts.z & 8): kept and marked 3 (drawn pure blue), so a pruned record that shows is counted
+        if ((mf.opts.z & 8) == 0) return;
+        r.w |= 3u << 25;
+    }
+    uint at = atomic_fetch_add_explicit(&cnt[k], 1u, memory_order_relaxed);
+    out[k * stride + at] = r;
+}
+
+// The kept records back into their sectors.
+kernel void lod_pk_facet_commit(constant PkParams& pk [[buffer(14)]], device uint* sec [[buffer(15)]], device uint4* recs [[buffer(7)]],
+                                device const uint4* out [[buffer(11)]], device const uint* cnt [[buffer(12)]], constant uint2& sel [[buffer(20)]],
+                                uint gid [[thread_position_in_grid]]) {
+    uint stride = max(pk.recCap, pk.recCap0);
+    uint k = gid / stride, i = gid % stride;
+    if (k >= 2u || ((sel.y >> k) & 1u) == 0u) return;
+    uint s = sel.x + k * uint(PK_AZ);
+    if (cnt[2u + k] != 0u) return;
+    if (i < cnt[k]) recs[pkRecBase(pk, s) + i] = out[k * stride + i];
+    if (i == 0u) sec[s * PK_SECTOR_WORDS] = cnt[k];
 }

@@ -262,7 +262,7 @@ final class MetalRenderPass implements RenderPassBackend {
 			case TEXEL_BUFFER -> {
 				GpuBufferSlice slice = (GpuBufferSlice) value;
 				var format = Objects.requireNonNull(uniform.gpuFormat());
-				long view = TexelViews.ON ? TexelViews.get(this.encoder, slice, MetalConst.pixelFormat(format), format.blockSize()) // opt-in
+				long view = TexelViews.ON && TexelViews.active ? TexelViews.get(this.encoder, slice, MetalConst.pixelFormat(format), format.blockSize()) // opt-in
 					: this.texelViews.computeIfAbsent(slice, s -> {
 					long handle = Native.textureBuffer(this.encoder.ctx, this.encoder.use(s.buffer()).handle, MetalConst.pixelFormat(format), s.offset(),
 						s.length(), format.blockSize());

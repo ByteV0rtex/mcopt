@@ -7,6 +7,15 @@ package mcopt.metal.lod;
 public final class LodConfig {
 	/** -Dmcopt.lod=true: far terrain on. A radius alone turns it on too. */
 	public static final boolean ENABLED = Boolean.getBoolean("mcopt.lod") || System.getProperty("mcopt.lod.radius") != null;
+	/**
+	 * -Dmcopt.lod.small=true: far terrain for small GPUs (a MacBook Neo's 5 cores). Its cost there is
+	 * geometry (the GPU cull and its survivors' quads), not pixels, so this mode culls and draws fewer cells: a quarter-size
+	 * clipmap window (lod.n 512: level 0 to ~190 blocks, inside a 16-chunk render distance, so the far terrain starts with
+	 * 2-block cells), with level 1 keeping what level 0 has at the hand-off: crowns floating over their ground and the game's
+	 * own trees (crownLevels 2, treeLevels 2); and the hand-off's depth push (lod.handoffPush 0.9995). Each can still be set
+	 * on its own; an explicit flag wins.
+	 */
+	public static final boolean SMALL = Boolean.getBoolean("mcopt.lod.small");
 	/** -Dmcopt.lod.radius=N: how far the far terrain reaches, in chunks (to the edge of the coarsest tiles drawn). */
 	public static final int RADIUS_CHUNKS = Integer.getInteger("mcopt.lod.radius", 512);
 	/**
@@ -15,7 +24,7 @@ public final class LodConfig {
 	 * would be, and N sets how big that is: at 5K, 2048 gives cells of 2.5-5 px (level 0 to ~960 blocks), 4096 1.2-2.5 px.
 	 * Memory: 8 N^2 bytes a level.
 	 */
-	public static final int N = Integer.getInteger("mcopt.lod.n", 2048);
+	public static final int N = Integer.getInteger("mcopt.lod.n", SMALL ? 512 : 2048);
 	/** -Dmcopt.lod.threads=N: generation workers (default: the cores the game and the GPU driver leave). */
 	public static final int THREADS = Integer.getInteger("mcopt.lod.threads", Math.max(2, Runtime.getRuntime().availableProcessors() - 4));
 	/**
@@ -23,7 +32,7 @@ public final class LodConfig {
 	 * under them), 0: crowns stand on the ground like pillars. Costs 4 bytes a cell on those levels. Default 1 (level 0, where
 	 * trees are several pixels).
 	 */
-	public static final int CROWN_LEVELS = Integer.getInteger("mcopt.lod.crownLevels", 1);
+	public static final int CROWN_LEVELS = Integer.getInteger("mcopt.lod.crownLevels", SMALL ? 2 : 1);
 	/**
 	 * -Dmcopt.lod.walk=segmented|serial: the column walk as one thread per column walking every level (serial), or a thread
 	 * per level of each column in two passes (segmented: more threads, a GPU this wide stays busy). Same picture.
@@ -52,7 +61,7 @@ public final class LodConfig {
 	 * terrain); coarser levels the biome's impostor canopy. Level 1 needs every chunk's block-exact ground: ~5x the work of
 	 * its tiles. Default 1.
 	 */
-	public static final int TREE_LEVELS = Integer.getInteger("mcopt.lod.treeLevels", 1);
+	public static final int TREE_LEVELS = Integer.getInteger("mcopt.lod.treeLevels", SMALL ? 2 : 1);
 	/** -Dmcopt.lod.crownShade=F: sky light factor under tree crowns (the game's sky light drops under leaves). */
 	public static final double CROWN_SHADE = Double.parseDouble(System.getProperty("mcopt.lod.crownShade", "0.7"));
 	/**

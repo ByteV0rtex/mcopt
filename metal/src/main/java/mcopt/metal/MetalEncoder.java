@@ -144,6 +144,7 @@ final class MetalEncoder implements CommandEncoderBackend {
 			this.afterThisFrame.add(() -> this.accumulateProfile(cmd, s, n));
 		}
 		this.inFlight.add(new Frame(this.submitIndex++, cmd, this.afterThisFrame));
+		if (mcopt.metal.cpu.Cpu.FENCE_STATS) mcopt.metal.cpu.Cpu.fenceTick(this.submitIndex); // opt-in
 		this.afterThisFrame = new ArrayList<>();
 		this.encoderIndex = 0;
 		if (this.submitIndex == MetalProbe.SUBMIT) this.probe = new MetalProbe();
@@ -292,7 +293,12 @@ final class MetalEncoder implements CommandEncoderBackend {
 					depthValue = clearDepth ? redirect.depthClear() : 0;
 				}
 			}
+			if (mcopt.metal.cpu.Cpu.PASS_AB) { // opt-in A/B: lever on odd frames
+				Native.cpuFlags(mcopt.metal.cpu.Cpu.nativeFlags((mcopt.metal.cpu.Ab.frame & 1) == 1));
+				mcopt.metal.cpu.Cpu.PASS_TIMER.begin();
+			}
 			int continued = Native.renderBegin(this.enc, colorCount, colorHandles, clears, depthHandle, clearDepth ? 1 : 0, (float) depthValue, width, height);
+			if (mcopt.metal.cpu.Cpu.PASS_AB) mcopt.metal.cpu.Cpu.PASS_TIMER.end();
 			if (redirect != null) redirect.delegate().begin(this.enc, depthHandle != 0);
 			if (keptDelegate != null) keptDelegate.begin(this.enc, depthHandle != 0);
 			MetalHooks.Labeler labeler = MetalHooks.labeler;
@@ -551,7 +557,12 @@ final class MetalEncoder implements CommandEncoderBackend {
 
 	@Override
 	public GpuFence createFence() {
-		long index = this.submitIndex;
+		long current = this.submitIndex;
+		// opt-in (-Dmcopt.cpu.fence): a fence made right after submit() with nothing recorded since (vanilla's uniform
+		// ring rotates its slot there) covers exactly the work already committed, so it names the last submit instead of the
+		// next, still empty one, and the ring's slot is free a frame sooner.
+		long index = mcopt.metal.cpu.Cpu.FENCE && mcopt.metal.cpu.Cpu.fenceActive && current > 0 && Native.encEmpty(this.enc) ? current - 1 : current;
+		if (mcopt.metal.cpu.Cpu.FENCE_STATS) mcopt.metal.cpu.Cpu.fenceMade(index != current);
 		return new GpuFence() {
 			@Override
 			public boolean awaitCompletion(long timeoutNs) {
@@ -560,11 +571,13 @@ final class MetalEncoder implements CommandEncoderBackend {
 					if (timeoutNs == 0) return false;
 					throw new IllegalStateException("Cannot wait on a fence for the current submit");
 				}
+				long t0 = mcopt.metal.cpu.Cpu.FENCE_STATS && timeoutNs != 0 ? System.nanoTime() : 0;
 				while (MetalEncoder.this.completedIndex < index) {
 					Frame oldest = MetalEncoder.this.inFlight.peek();
 					if (timeoutNs == 0 && !Native.cmdDone(oldest.cmd)) return false;
 					MetalEncoder.this.retire(MetalEncoder.this.inFlight.poll());
 				}
+				if (t0 != 0) mcopt.metal.cpu.Cpu.fenceWaited(System.nanoTime() - t0);
 				return true;
 			}
 

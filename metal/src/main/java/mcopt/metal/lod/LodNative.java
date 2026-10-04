@@ -9,6 +9,7 @@ import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 
 import static java.lang.foreign.ValueLayout.JAVA_DOUBLE;
+import static java.lang.foreign.ValueLayout.JAVA_FLOAT;
 import static java.lang.foreign.ValueLayout.JAVA_INT;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
 
@@ -32,6 +33,8 @@ final class LodNative {
 		JAVA_LONG, JAVA_INT);
 	private static final MethodHandle PK_CULL = fn("mcl_pk_cull", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_LONG,
 		JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT);
+	private static final MethodHandle PK_VIS = fn("mcl_pk_vis", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_LONG,
+		JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_FLOAT, JAVA_FLOAT, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT);
 	private static final MethodHandle CULL_TIME_SLOT = fn("mcl_cull_time_slot", false, JAVA_INT, JAVA_LONG, JAVA_INT);
 	private static final MethodHandle CULL_TIME_READ = fn("mcl_cull_time_read", false, JAVA_DOUBLE, JAVA_LONG, JAVA_INT);
 	private static final MethodHandle SHARED_TRACKED = fn("mcl_shared_tracked_buffer", false, JAVA_LONG, JAVA_LONG, JAVA_LONG);
@@ -159,6 +162,23 @@ final class LodNative {
 			throw rethrow(t);
 		}
 		if (r != 0) throw new IllegalStateException("lod: the position-keyed lists' pipelines are missing");
+	}
+
+	/**
+	 * The lists' visible set (mclod.m mcl_pk_vis): prunes azimuth az's sectors in bandMask (1 the hand-off band, 2 the far
+	 * band) against a depth facet drawn from facet (a CompFrame, fw x fh) of the sectors in use (use: 4 x 32-bit masks).
+	 * Throws when a pipeline is missing.
+	 */
+	static void pkVis(long lod, long enc, long frame, int frameLength, long facet, int facetLength, long params, int paramsLength, long bufs, int az,
+		int bandMask, float eps0, float eps1, long use, int fw, int fh, int stride) {
+		int r;
+		try {
+			r = (int) PK_VIS.invokeExact(lod, enc, frame, frameLength, facet, facetLength, params, paramsLength, bufs, az, bandMask, eps0, eps1, use, fw, fh,
+				stride);
+		} catch (Throwable t) {
+			throw rethrow(t);
+		}
+		if (r != 0) throw new IllegalStateException("lod: the visible set's pipelines are missing");
 	}
 
 	/** The next cull (meshCull or pkCull) samples its GPU time into slot (0-15); false when the GPU can't. */

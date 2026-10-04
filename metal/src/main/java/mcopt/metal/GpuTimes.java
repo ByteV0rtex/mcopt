@@ -12,6 +12,7 @@ public final class GpuTimes {
 	private static final int CAPACITY = 1 << 20;
 	private static final long[] submitNs = new long[CAPACITY], startNs = new long[CAPACITY], endNs = new long[CAPACITY];
 	private static final boolean[] presenting = new boolean[CAPACITY];
+	private static final long[] pollNs = Latency.ON ? new long[CAPACITY] : null;
 	private static final long[] calibration = calibrate();
 	private static int retired;
 	private static long dropped;
@@ -40,6 +41,7 @@ public final class GpuTimes {
 	static void present(long index, long drawable) {
 		if (index >= CAPACITY) return;
 		presenting[(int) index] = true;
+		if (pollNs != null) pollNs[(int) index] = Latency.lastPollNs;
 		Native.cadencePresent(drawable, (int) index);
 	}
 	static void retire(long index, long cmd) {
@@ -68,6 +70,7 @@ public final class GpuTimes {
 		out.put("gpuStartNs", Arrays.copyOf(startNs, retired));
 		out.put("gpuEndNs", Arrays.copyOf(endNs, retired));
 		out.put("presenting", Arrays.copyOf(presenting, retired));
+		if (pollNs != null) out.put("pollNs", Arrays.copyOf(pollNs, retired));
 		long[] handlers = new long[retired], presented = new long[retired];
 		for (int i = 0; i < retired; i++) {
 			long h = Native.cadenceHandler(i), p = Native.cadencePresented(i);
@@ -83,7 +86,7 @@ public final class GpuTimes {
 			for (int i = 0; i < retired; i++)
 				if (endNs[i] >= range[0] && endNs[i] < range[1]) count++;
 			long[] indices = new long[count], submits = new long[count], starts = new long[count], allEnds = new long[count];
-			long[] callback = new long[count], scanout = new long[count], ends = new long[count];
+			long[] callback = new long[count], scanout = new long[count], ends = new long[count], polls = new long[count];
 			boolean[] presents = new boolean[count];
 			int n = 0, row = 0;
 			for (int i = 0; i < retired; i++) {
@@ -94,6 +97,7 @@ public final class GpuTimes {
 				allEnds[row] = endNs[i];
 				presents[row] = presenting[i];
 				callback[row] = handlers[i];
+				if (pollNs != null) polls[row] = pollNs[i];
 				scanout[row++] = presented[i];
 				if (presenting[i]) ends[n++] = endNs[i];
 			}
@@ -105,6 +109,7 @@ public final class GpuTimes {
 			gpuFrames.put("presenting", presents);
 			gpuFrames.put("presentedHandlerNs", callback);
 			gpuFrames.put("presentedTimeNs", scanout);
+			if (pollNs != null) gpuFrames.put("pollNs", polls);
 			phase.put("gpuFrames", gpuFrames);
 			phase.put("gpuEndNs", Arrays.copyOf(ends, n)); // presenting submits only
 			phase.put("gpuPresentingFrames", n);

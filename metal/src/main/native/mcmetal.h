@@ -46,6 +46,15 @@ typedef struct {
 	id<MTLBlitCommandEncoder> preBlit;
 	id<MTLComputeCommandEncoder> preCompute;
 	unsigned renderSerial;  // bumped for every render encoder opened (the native shading pipeline tells encoders apart by it)
+	// opt-in (-Dmcopt.cpu.pass): mc_render_begin's pass descriptor, kept and reset instead of made per pass; the color
+	// attachments it may still name (cpuPassColors), and whether profiling put a sample buffer on it.
+	MTLRenderPassDescriptor *cpuPassDesc;
+	int cpuPassColors, cpuPassSampled;
+	// opt-in (-Dmcopt.cpu.cmdAhead): the next frame's command buffer, made on a background queue right after a commit;
+	// cmd() takes it (waiting for it if it isn't made yet) instead of making one on the render thread.
+	id<MTLCommandBuffer> cpuNext;
+	dispatch_semaphore_t cpuNextReady;
+	int cpuNextPending;
 } Enc;
 
 id<MTLCommandBuffer> mc_pre(Enc *enc);

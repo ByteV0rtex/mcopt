@@ -30,7 +30,8 @@ final class LodTaaTile {
 	static final boolean ON = EMPTY || ALPHA > 0;
 	/** The mesh fragments write the distance code (the filter runs). */
 	static final boolean CODES = ALPHA > 0 || Boolean.getBoolean("mcopt.lod.taaTileCodes");
-	/** -Dmcopt.lod.taaTileDebug=BITS (pricing only): 1 no history sample, 2 no history write, 4 no neighbourhood. */
+	/** -Dmcopt.lod.taaTileDebug=BITS (pricing only): 1 no history sample, 2 no history write, 4 no neighbourhood, 8 no
+	 * reprojection, 16 return after reading, 64 no flat skip, 128 no dithered history. */
 	static final int DEBUG = Integer.getInteger("mcopt.lod.taaTileDebug", 0);
 	static final float GROW = Float.parseFloat(System.getProperty("mcopt.lod.taaGrow", "0.25"));
 	private static final int FRAME_BYTES = 9 * 16;
@@ -46,7 +47,7 @@ final class LodTaaTile {
 	private boolean affineWarned;
 	private double px, py, pz;
 	private boolean valid, warned;
-	private int skipped;
+	private int skipped, frameNo;
 
 	LodTaaTile(long ctx) {
 		try (MemoryStack stack = MemoryStack.stackPush()) {
@@ -129,7 +130,7 @@ final class LodTaaTile {
 		MemoryUtil.memPutFloat(f + 112, ALPHA);
 		MemoryUtil.memPutFloat(f + 116, GROW);
 		MemoryUtil.memPutFloat(f + 120, EMPTY ? 1 : 2);
-		MemoryUtil.memPutFloat(f + 124, 0);
+		MemoryUtil.memPutFloat(f + 124, this.frameNo++ & 63);
 		MemoryUtil.memPutInt(f + 128, width);
 		MemoryUtil.memPutInt(f + 132, height);
 		MemoryUtil.memPutInt(f + 136, DEBUG);

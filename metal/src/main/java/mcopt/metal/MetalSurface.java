@@ -16,7 +16,10 @@ final class MetalSurface implements GpuSurfaceBackend {
 	/** With vsync off, present only the last frame that makes each refresh (see mc_pace); -Dmcopt.metal.pace=false presents every frame. */
 	private static final boolean PACE = Boolean.parseBoolean(System.getProperty("mcopt.metal.pace", "true"));
 	/** How long before a refresh a finished frame has to reach the compositor to be shown on it. */
-	private static final double PACE_MARGIN_S = 0.002;
+	/** -Dmcopt.metal.paceMarginMs: how long before a refresh the paced present must be done (the compositor's latch); default 2. */
+	private static final double PACE_MARGIN_S = Double.parseDouble(System.getProperty("mcopt.metal.paceMarginMs", "2")) / 1000;
+	/** -Dmcopt.metal.drawables=2|3: the layer's maximumDrawableCount (default 3). */
+	private static final int DRAWABLES = Integer.getInteger("mcopt.metal.drawables", 0);
 	private boolean paced;
 	private final long ctx;
 	private final MetalEncoder encoder;
@@ -34,7 +37,7 @@ final class MetalSurface implements GpuSurfaceBackend {
 	public void configure(GpuSurface.Configuration config) {
 		boolean vsync = config.presentMode() == GpuSurface.PresentMode.FIFO;
 		// Frame generation schedules every present on the display's refresh grid, which needs vsync (FrameGen).
-		Native.layerConfigure(this.ctx, this.layer, config.width(), config.height(), vsync || FrameGen.ENABLED ? 1 : 0);
+		Native.layerConfigure(this.ctx, this.layer, config.width(), config.height(), (vsync || FrameGen.ENABLED ? 1 : 0) | DRAWABLES << 8);
 		this.paced = !vsync && PACE && !FrameGen.ENABLED;
 	}
 

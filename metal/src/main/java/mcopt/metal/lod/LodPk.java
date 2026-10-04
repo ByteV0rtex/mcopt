@@ -39,17 +39,44 @@ final class LodPk {
 	/** -Dmcopt.lod.pkSel: blocks (horizontally) the camera may go from the selection camera before a new generation. */
 	static final double SEL = Double.parseDouble(System.getProperty("mcopt.lod.pkSel", "32"));
 	/**
-	 * -Dmcopt.lod.pkFast: blocks a second above which the full cull draws instead of the lists (back to the lists under 3/4
-	 * of it). A fast camera spends more on rebuilds than the lists save; 0: the lists always.
+	 * -Dmcopt.lod.pkFast: blocks a second (the camera's speed, smoothed over ~0.25 s) above which the full cull draws
+	 * instead of the lists (back to the lists under 3/4 of it); 0: the lists always. The default, 0.5: the lists only for
+	 * a camera at rest or turning in place, where they win (spin +27% on the mini); a moving camera (walk, sprint, cruise,
+	 * flight) spends on rebuilds what they save, and the full cull with the real terrain occluding is as fast or faster.
 	 */
-	static final double FAST = Double.parseDouble(System.getProperty("mcopt.lod.pkFast", "8"));
+	static final double FAST = Double.parseDouble(System.getProperty("mcopt.lod.pkFast", "0.5"));
+	/**
+	 * -Dmcopt.lod.pkFarEps: the far band's margin, up to this many blocks (0: the hand-off band's). A moving camera wears
+	 * the far band's margins out as fast as the hand-off band's, but there a wide margin costs little (its faces and the
+	 * horizon's distant occluders barely turn): 4x the hand-off band's, capped here. A rebuild batch holds one band.
+	 */
+	static final float FAR_EPS = Float.parseFloat(System.getProperty("mcopt.lod.pkFarEps", "0"));
+	/**
+	 * -Dmcopt.lod.pkVis: the lists' visible set. A few built sectors a frame are pruned to the records a depth facet from their
+	 * build camera shows (columns.metal lod_pk_facet_*), held for any camera within the sector's margin: the same picture,
+	 * except through gaps narrower than a facet texel. -Dmcopt.lod.pkVisRes: the facets' angular resolution against the
+	 * screen's; -Dmcopt.lod.pkVisPerFrame: sectors pruned a frame at most.
+	 */
+	static final boolean VIS = ENABLED && Boolean.getBoolean("mcopt.lod.pkVis");
+	static final double VIS_RES = Double.parseDouble(System.getProperty("mcopt.lod.pkVisRes", "1"));
+	static final int VIS_PER_FRAME = Integer.getInteger("mcopt.lod.pkVisPerFrame", 4);
+	/**
+	 * -Dmcopt.lod.pkVisEps=B (debug: mark mode's positive control): the prune's margin B blocks instead of the sector's. A
+	 * negative one prunes records that show, which -Dmcopt.lod.hzMark then draws pure blue.
+	 */
+	static final String VIS_EPS = System.getProperty("mcopt.lod.pkVisEps");
 	/** -Dmcopt.lod.pkBudget: sectors rebuilt in a frame at most. */
 	static final int BUDGET = Integer.getInteger("mcopt.lod.pkBudget", 32);
 	/** -Dmcopt.lod.pkBand: the hand-off band reaches this many blocks past the real terrain's (the mask's) farthest chunk. */
 	static final float BAND = Float.parseFloat(System.getProperty("mcopt.lod.pkBand", "64"));
 	/** Azimuth sectors, bands; sector a + AZ * band (0 the hand-off band, 1 the far band). */
 	static final int AZ = 64, BANDS = 2, SECTORS = AZ * BANDS, WORDS = 16, PARAMS_BYTES = 96;
-	private static final int PLANT_CAP = 4096, STAND_CAP = 2048, RING = 4;
+	private static final int PLANT_CAP = 4096, RING = 4;
+	/**
+	 * Stand-in instances a sector holds: the instance buffer past STAND_BASE (LodMesh.MAX_INSTANCES), shared out. A cold
+	 * join stands coarse blocks in for most of the far terrain, so this is generous (2048 overflowed there).
+	 */
+	private static final int STAND_CAP = ((1 << 21) - (1 << 18)) / (64 * 2);
 	/** How far a block of the hand-off band can reach past the band (its center is in it): the margin of its in-view test. */
 	private static final double BAND_REACH = 256;
 	/** Where the sectors' stand-in instances start in the mesh's instance buffer (the culls' own instances stay below). */
@@ -160,7 +187,8 @@ final class LodPk {
 
 	/** The real terrain's hand-off changed at chunk (cx, cz): the blocks there and their neighbors. */
 	void chunkChanged(int cx, int cz) {
-		this.markArea(cx * 16.0 - 16, cz * 16.0 - 16, cx * 16.0 + 32, cz * 16.0 + 32, false);
+		// (with the visible set, the far blocks there may have hidden other sectors' records: those behind them too)
+		this.markArea(cx * 16.0 - 16, cz * 16.0 - 16, cx * 16.0 + 32, cz * 16.0 + 32, VIS);
 	}
 
 	/** Set by the owner: the levels' switch distances (LodClip.switchDist). */
@@ -186,6 +214,7 @@ final class LodPk {
 		double m = SEL + EPS + 2;
 		if (x0 <= m && x1 >= -m && z0 <= m && z1 >= -m) {
 			java.util.Arrays.fill(this.dirty, true);
+			java.util.Arrays.fill(this.full, false);
 			return;
 		}
 		double nx = Math.max(0, Math.max(x0, -x1)), nz = Math.max(0, Math.max(z0, -z1));
@@ -205,6 +234,8 @@ final class LodPk {
 			int a = Math.floorMod(s, AZ);
 			if (band0) this.dirty[a] = true;
 			if (band1) this.dirty[AZ + a] = true;
+			if (band0) this.full[a] = false;
+			if (band1) this.full[AZ + a] = false;
 			// (for the load switch: sectors in view dirtied)
 			if (band0 && this.inViewS[a]) this.dirtyMarks++;
 			if (band1 && this.inViewS[AZ + a]) this.dirtyMarks++;
@@ -246,16 +277,19 @@ final class LodPk {
 		this.lastX = cx;
 		this.lastY = cy;
 		this.lastZ = cz;
-		this.batchEps = (float) Math.min(4.0, Math.max(EPS, this.speed * 12));
+		float nearEps = (float) Math.min(4.0, Math.max(EPS, this.speed * 12));
+		float farEps = FAR_EPS > 0 ? (float) Math.max(nearEps, Math.min(FAR_EPS, this.speed * 48)) : nearEps;
+		this.batchEps = nearEps;
 		// (the band radius holds for a generation: a block's band is part of its home)
-		double band = maskDist + BAND;
-		if (!this.selSet || Math.hypot(cx - this.selX, cz - this.selZ) > SEL || band != this.bandR) {
+		double bandAt = maskDist + BAND;
+		if (!this.selSet || Math.hypot(cx - this.selX, cz - this.selZ) > SEL || bandAt != this.bandR) {
 			this.selSet = true;
 			this.selX = cx;
 			this.selZ = cz;
-			this.bandR = band;
+			this.bandR = bandAt;
 			java.util.Arrays.fill(this.built, false);
 			java.util.Arrays.fill(this.dirty, false);
+			java.util.Arrays.fill(this.full, false);
 			this.statGenerations++;
 		}
 		this.reach = reach;
@@ -266,7 +300,7 @@ final class LodPk {
 			inView[s] = ((s < AZ ? inNear : inFar) >>> (s & (AZ - 1)) & 1) != 0;
 			double dx = cx - this.bx[s], dy = cy - this.by[s], dz = cz - this.bz[s];
 			stale[s] = Math.sqrt(dx * dx + dy * dy + dz * dz) / this.eps[s];
-			valid[s] = this.built[s] && !this.dirty[s] && stale[s] <= 0.98;
+			valid[s] = this.built[s] && !this.dirty[s] && stale[s] <= 0.98 && !this.full[s];
 			rb[s] = false;
 			if (!valid[s] && inView[s]) {
 				if (!this.built[s]) this.statUnbuilt++;
@@ -282,17 +316,17 @@ final class LodPk {
 		boolean must = false;
 		double oldest = 0;
 		for (int s = 0; s < SECTORS; s++) {
-			must |= inView[s] && !valid[s];
+			must |= inView[s] && !valid[s] && !this.full[s];
 			if (inView[s] && valid[s]) oldest = Math.max(oldest, stale[s]);
 		}
 		// (out of view: only for a camera at rest; a moving one would see them expire unseen)
 		boolean due = must || oldest >= 0.6, background = this.speed < 0.005 && (due || this.statFramesTotal % 16 == 0);
-		int n = 0;
+		int n = 0, band = -1;
 		while (due && n < BUDGET) {
 			int best = -1;
 			double bestD = 0;
 			for (int s = 0; s < SECTORS; s++) {
-				if (!inView[s] || valid[s] || rb[s]) continue;
+				if (!inView[s] || valid[s] || rb[s] || this.full[s] || (band >= 0 && s / AZ != band)) continue;
 				double d = Math.abs(((s & (AZ - 1)) + 0.5) * (4.0 / AZ) - fa);
 				d = Math.min(d, 4 - d);
 				if (best < 0 || d < bestD) {
@@ -303,21 +337,25 @@ final class LodPk {
 			if (best < 0) break;
 			rb[best] = true;
 			n++;
+			// (one band a batch: its margin is the frame's)
+			if (FAR_EPS > 0) band = best / AZ;
 		}
 		while (due && n < BUDGET) {
 			int best = -1;
 			for (int s = 0; s < SECTORS; s++)
-				if (inView[s] && !rb[s] && valid[s] && stale[s] > 0.3 && (best < 0 || stale[s] > stale[best])) best = s;
+				if (inView[s] && !rb[s] && valid[s] && stale[s] > 0.3 && (band < 0 || s / AZ == band) && (best < 0 || stale[s] > stale[best])) best = s;
 			if (best < 0) break;
 			rb[best] = true;
 			n++;
+			if (FAR_EPS > 0) band = best / AZ;
 		}
 		for (int s = 0, bg = 0; background && s < SECTORS && n < BUDGET + 4 && bg < 4; s++)
-			if (!valid[s] && !rb[s]) {
+			if (!valid[s] && !rb[s] && !this.full[s] && (band < 0 || s / AZ == band) && (FAR_EPS <= 0 || band >= 0 || (band = s / AZ) >= 0)) {
 				rb[s] = true;
 				n++;
 				bg++;
 			}
+		if (band == 1) this.batchEps = farEps;
 		long r0 = 0, r1 = 0, d0 = 0, d1 = 0, l0 = 0, l1 = 0;
 		for (int s = 0; s < SECTORS; s++) {
 			long bit = 1L << (s & (AZ - 1));
@@ -380,10 +418,10 @@ final class LodPk {
 	int statFastFrames, statSwitches;
 
 	/**
-	 * -Dmcopt.lod.pkSwitch: what decides which path draws. load (the default): the cheaper of the two by the GPU time the
-	 * culls' encoders measure (where the GPU can't sample it: the speed switch); speed: the full cull above FAST b/s.
+	 * -Dmcopt.lod.pkSwitch: what decides which path draws. speed (the default): the full cull above FAST b/s; load: the
+	 * cheaper of the two by the GPU time the culls' encoders measure (where the GPU can't sample it: the speed switch).
 	 */
-	static final boolean LOAD = !"speed".equals(System.getProperty("mcopt.lod.pkSwitch", "load"));
+	static final boolean LOAD = "load".equals(System.getProperty("mcopt.lod.pkSwitch", "speed"));
 	/**
 	 * The load switch: the lists draw while their cull costs at most 1 - MARGIN of the full cull's (they draw more survivors,
 	 * which the cull's time doesn't see), and come back once they'd cost under 1 - 2 MARGIN of it; a switch waits for
@@ -408,12 +446,11 @@ final class LodPk {
 		long now = System.nanoTime();
 		if (this.trackNanos != 0) {
 			double dt = Math.max(1e-4, (now - this.trackNanos) / 1e9);
-			// (horizontal: stepping up and down a hill is short bursts of vertical speed)
-			double dx = cx - this.tx, dz = cz - this.tz, d = Math.sqrt(dx * dx + dz * dz);
-			double dy = cy - this.ty, d3 = Math.sqrt(d * d + dy * dy);
+			// (3D: a camera rising or falling wears the lists' margins out as moving does)
+			double dx = cx - this.tx, dz = cz - this.tz, dy = cy - this.ty, d3 = Math.sqrt(dx * dx + dy * dy + dz * dz);
 			double a = Math.min(1, dt / 0.25);
 			// (a jump of more than 16 blocks in a frame is a teleport, not speed)
-			this.bps = d > 16 ? 0 : this.bps + (d / dt - this.bps) * a;
+			this.bps = d3 > 16 ? 0 : this.bps + (d3 / dt - this.bps) * a;
 			this.perFrame = d3 > 16 ? 0 : this.perFrame + (d3 - this.perFrame) * 0.1;
 		}
 		this.trackNanos = now;
@@ -424,6 +461,7 @@ final class LodPk {
 		boolean was = this.fast;
 		this.framesSinceTimed++;
 		if (load && this.tFull > 0) this.fast = !this.loadSwitch(now, cx, cy, cz, viewProj, reach);
+		else if (FAST < 0) this.fast = true;   // (a control: the lists kept up to date by nothing, never drawn)
 		else if (FAST > 0) this.fast = this.fast ? this.bps > FAST * 0.75 : this.bps > FAST;
 		if (was != this.fast) {
 			this.statSwitches++;
@@ -564,7 +602,80 @@ final class LodPk {
 			this.bx[s] = cx;
 			this.by[s] = cy;
 			this.bz[s] = cz;
+			this.visPending[s] = VIS;
 		}
+	}
+
+	// ---- the visible set (VIS) ----
+
+	private final boolean[] visPending = new boolean[SECTORS];
+	private final long visFacet = MemoryUtil.nmemCalloc(1, 512), visUse = MemoryUtil.nmemCalloc(1, 16);
+	int statVisPruned;
+
+	/**
+	 * After prepare, before the frame's cull: prunes up to VIS_PER_FRAME sectors built in earlier frames and still valid (in
+	 * view first), each against a facet from its build camera. comp: this frame's CompFrame (the facets copy the rest of it).
+	 */
+	void prune(long lod, long enc, long frame, int frameLength, long comp, int compLength, long bufs) {
+		if (!VIS) return;
+		long u0 = 0, u1 = 0;
+		for (int s = 0; s < SECTORS; s++)
+			if (this.built[s] && !this.dirty[s]) {
+				if (s < AZ) u0 |= 1L << s;
+				else u1 |= 1L << (s - AZ);
+			}
+		MemoryUtil.memPutLong(this.visUse, u0);
+		MemoryUtil.memPutLong(this.visUse + 8, u1);
+		// the screen's focal length in pixels (CompFrame tex.x: radians a pixel spans)
+		double texX = MemoryUtil.memGetFloat(comp + 240);
+		double focal = texX > 0 ? 1.0 / texX : 1000;
+		for (int n = 0; n < VIS_PER_FRAME; n++) {
+			int best = -1;
+			for (int s = 0; s < SECTORS; s++) {
+				if (!this.visPending[s] || !this.validS[s] || this.rbS[s]) continue;
+				if (best < 0 || this.inViewS[s] && !this.inViewS[best]) best = s;
+			}
+			if (best < 0) break;
+			this.visPending[best] = false;
+			int a = best & (AZ - 1);
+			// the facet: along the sector's middle, a sector wide past each edge, 35 degrees up and down
+			double ex = dirX(a), ez = dirZ(a), fx = dirX(a + 0.5), fz = dirZ(a + 0.5), gx = dirX(a + 1), gz = dirZ(a + 1);
+			double half = Math.acos(Math.min(1, ex * gx + ez * gz)), th = Math.tan(half), tv = Math.tan(Math.toRadians(35));
+			int fw = (int) Math.ceil(th * focal * 2 * VIS_RES), fh = (int) Math.ceil(tv * focal * 2 * VIS_RES);
+			MemoryUtil.memCopy(comp, this.visFacet, compLength);
+			long f = this.visFacet;
+			double sx = 1 / th, sy = 1 / tv, rx = -fz, rz = fx;
+			float[] m = {(float) (rx * sx), 0, 0, (float) fx, 0, (float) sy, 0, 0, (float) (rz * sx), 0, 0, (float) fz, 0, 0, 1, 0};
+			for (int i = 0; i < 16; i++) MemoryUtil.memPutFloat(f + i * 4L, m[i]);
+			MemoryUtil.memPutFloat(f + 112, fw);
+			MemoryUtil.memPutFloat(f + 116, fh);
+			double ox = Math.floor(this.bx[best]), oy = Math.floor(this.by[best]), oz = Math.floor(this.bz[best]);
+			MemoryUtil.memPutInt(f + 208, (int) ox);
+			MemoryUtil.memPutInt(f + 212, (int) oy);
+			MemoryUtil.memPutInt(f + 216, (int) oz);
+			MemoryUtil.memPutFloat(f + 224, (float) (this.bx[best] - ox));
+			MemoryUtil.memPutFloat(f + 228, (float) (this.by[best] - oy));
+			MemoryUtil.memPutFloat(f + 232, (float) (this.bz[best] - oz));
+			float e = VIS_EPS != null ? Float.parseFloat(VIS_EPS) : this.eps[best];
+			LodNative.pkVis(lod, enc, frame, frameLength, f, compLength, this.params, PARAMS_BYTES, bufs, a, best < AZ ? 1 : 2, e, e,
+				this.visUse, fw, fh, Math.max(this.recCap, this.recCap0));
+			this.statVisPruned++;
+		}
+	}
+
+	/** The direction (x, z: unit) of diamond angle a x 4 / AZ (sector a's start; columns.metal hzAzimuth's inverse). */
+	private static double dirX(double a) {
+		double d = a * (4.0 / AZ);
+		d -= 4 * Math.floor(d / 4);
+		double q = d < 2 ? 1 - d : d - 3, z = d < 2 ? 1 - Math.abs(q) : Math.abs(q) - 1;
+		return q / Math.hypot(q, z);
+	}
+
+	private static double dirZ(double a) {
+		double d = a * (4.0 / AZ);
+		d -= 4 * Math.floor(d / 4);
+		double q = d < 2 ? 1 - d : d - 3, z = d < 2 ? 1 - Math.abs(q) : Math.abs(q) - 1;
+		return z / Math.hypot(q, z);
 	}
 
 	/**
@@ -670,18 +781,37 @@ final class LodPk {
 		if (flags == 0) return;
 		this.statOverflows++;
 		boolean grow0 = (near & 1) != 0 && this.recCap0 < (1 << 20), grow1 = (flags & ~near & 1) != 0 && this.recCap < (1 << 20);
-		System.out.println("mcopt-lod: position-keyed lists overflowed (" + ((flags & 1) != 0 ? "records " : "") + ((flags & 2) != 0 ? "plants " : "")
-			+ ((flags & 4) != 0 ? "stand-ins " : "") + "); records per sector " + this.recCap0 + (grow0 ? " -> " + this.recCap0 * 2 : "") + " (hand-off band), "
-			+ this.recCap + (grow1 ? " -> " + this.recCap * 2 : "") + " (far band)");
-		for (int s = 0; s < SECTORS; s++) MemoryUtil.memPutInt(this.secAddr + ((long) s * WORDS + 15) * 4, 0);
+		// (logged at most every 10 s: a print on the render thread costs)
+		long now = System.nanoTime();
+		if (now - this.overflowLogged > 10_000_000_000L) {
+			this.overflowLogged = now;
+			System.out.println("mcopt-lod: position-keyed lists overflowed (" + ((flags & 1) != 0 ? "records " : "") + ((flags & 2) != 0 ? "plants " : "")
+				+ ((flags & 4) != 0 ? "stand-ins " : "") + "); records per sector " + this.recCap0 + (grow0 ? " -> " + this.recCap0 * 2 : "") + " (hand-off band), "
+				+ this.recCap + (grow1 ? " -> " + this.recCap * 2 : "") + " (far band); " + this.statOverflows + " overflows so far");
+		}
 		if (grow0 || grow1) {
+			for (int s = 0; s < SECTORS; s++) MemoryUtil.memPutInt(this.secAddr + ((long) s * WORDS + 15) * 4, 0);
 			this.releaseLater.add(new long[] {this.statFramesTotal, this.recBuf});
 			if (grow0) this.recCap0 *= 2;
 			if (grow1) this.recCap *= 2;
 			this.recBuf = LodNative.privateBuffer(this.ctx, (long) AZ * (this.recCap0 + this.recCap) * 16);
+			java.util.Arrays.fill(this.built, false);
+			return;
 		}
-		java.util.Arrays.fill(this.built, false);
+		// what can't grow (plants, stand-ins, records at their largest): those sectors draw by the live cull until what they hold
+		// changes (rebuilding them now would only overflow again, every frame)
+		for (int s = 0; s < SECTORS; s++) {
+			long w = this.secAddr + ((long) s * WORDS + 15) * 4;
+			if (MemoryUtil.memGetInt(w) != 0) {
+				this.full[s] = true;
+				MemoryUtil.memPutInt(w, 0);
+			}
+		}
 	}
+
+	/** Sectors that overflowed what can't grow: never drawable (the live cull draws them) until dirtied or a new generation. */
+	private final boolean[] full = new boolean[SECTORS];
+	private long overflowLogged;
 
 	double recordsMb() {
 		return (double) AZ * (this.recCap0 + this.recCap) * 16 / 1048576.0;

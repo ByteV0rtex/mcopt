@@ -43,6 +43,7 @@ final class Native {
 	private static final MethodHandle ENC_COMMIT = fn("mc_enc_commit", false, JAVA_LONG, JAVA_LONG);
 	private static final MethodHandle CMD_WAIT = fn("mc_cmd_wait", false, null, JAVA_LONG);
 	private static final MethodHandle CMD_DONE = fn("mc_cmd_done", true, JAVA_INT, JAVA_LONG);
+	private static final MethodHandle ENC_EMPTY = fn("mc_enc_empty", true, JAVA_INT, JAVA_LONG);
 	private static final MethodHandle CMD_GPU_END = fn("mc_cmd_gpu_end", false, JAVA_DOUBLE, JAVA_LONG);
 	private static final MethodHandle CMD_GPU_START = fn("mc_cmd_gpu_start", false, JAVA_DOUBLE, JAVA_LONG);
 	private static final MethodHandle HOST_SECONDS = fn("mc_host_seconds", false, JAVA_DOUBLE);
@@ -51,6 +52,7 @@ final class Native {
 	private static final MethodHandle CADENCE_PRESENTED = fn("mc_cadence_presented", false, JAVA_LONG, JAVA_INT);
 	private static final MethodHandle CMD_GPU_US = fn("mc_cmd_gpu_us", false, JAVA_DOUBLE, JAVA_LONG);
 	private static final MethodHandle DIAG_ENABLE = fn("mc_diag_enable", false, null, JAVA_DOUBLE);
+	private static final MethodHandle CPU_FLAGS = fn("mc_cpu_flags", false, null, JAVA_INT);
 	private static final MethodHandle POOL_ADD = fn("mc_pool_add", false, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_INT);
 	private static final MethodHandle POOL_TAKE = fn("mc_pool_take", false, JAVA_LONG, JAVA_LONG, JAVA_LONG);
 	private static final MethodHandle BUFFER_LENGTH = fn("mc_buffer_length", true, JAVA_LONG, JAVA_LONG);
@@ -159,6 +161,7 @@ final class Native {
 	static long encCommit(long enc) { try { return (long) ENC_COMMIT.invokeExact(enc); } catch (Throwable t) { throw rethrow(t); } }
 	static void cmdWait(long cmd) { try { CMD_WAIT.invokeExact(cmd); } catch (Throwable t) { throw rethrow(t); } }
 	static boolean cmdDone(long cmd) { try { return (int) CMD_DONE.invokeExact(cmd) != 0; } catch (Throwable t) { throw rethrow(t); } }
+	static boolean encEmpty(long enc) { try { return (int) ENC_EMPTY.invokeExact(enc) != 0; } catch (Throwable t) { throw rethrow(t); } }
 	static double cmdGpuEnd(long cmd) { try { return (double) CMD_GPU_END.invokeExact(cmd); } catch (Throwable t) { throw rethrow(t); } }
 	static double cmdGpuStart(long cmd) { try { return (double) CMD_GPU_START.invokeExact(cmd); } catch (Throwable t) { throw rethrow(t); } }
 	static double hostSeconds() { try { return (double) HOST_SECONDS.invokeExact(); } catch (Throwable t) { throw rethrow(t); } }
@@ -167,6 +170,7 @@ final class Native {
 	static long cadencePresented(int slot) { try { return (long) CADENCE_PRESENTED.invokeExact(slot); } catch (Throwable t) { throw rethrow(t); } }
 	static double cmdGpuMicros(long cmd) { try { return (double) CMD_GPU_US.invokeExact(cmd); } catch (Throwable t) { throw rethrow(t); } }
 	static void diagEnable(double thresholdMs) { try { DIAG_ENABLE.invokeExact(thresholdMs); } catch (Throwable t) { throw rethrow(t); } }
+	static void cpuFlags(int flags) { try { CPU_FLAGS.invokeExact(flags); } catch (Throwable t) { throw rethrow(t); } }
 	static boolean poolAdd(long ctx, long size, int delayMs) { try { return (int) POOL_ADD.invokeExact(ctx, size, delayMs) != 0; } catch (Throwable t) { throw rethrow(t); } }
 	static long poolTake(long minLength, long maxLength) { try { return (long) POOL_TAKE.invokeExact(minLength, maxLength); } catch (Throwable t) { throw rethrow(t); } }
 	static long bufferLength(long buffer) { try { return (long) BUFFER_LENGTH.invokeExact(buffer); } catch (Throwable t) { throw rethrow(t); } }

@@ -19,8 +19,9 @@ public final class CpuMixinPlugin implements IMixinConfigPlugin {
 		String name = mixinClassName.substring(mixinClassName.lastIndexOf('.') + 1);
 		if (name.endsWith("Access")) return Cpu.cullHooks();
 		if (name.startsWith("Cull")) return Cpu.cullHooks();
-		if (name.startsWith("AbFrame")) return Cpu.LISTS_AB || Cpu.MODEL_AB || Cpu.MERGE_AB || mcopt.metal.cpu.EntityBox.AB;
+		if (name.startsWith("AbFrame")) return Cpu.AB_SHOTS || Cpu.PASS_AB || Cpu.LEASH_AB || Cpu.LISTS_AB || Cpu.MODEL_AB || Cpu.MERGE_AB || mcopt.metal.cpu.EntityBox.AB;
 		if (name.startsWith("List")) return Cpu.LISTS;
+		if (name.startsWith("Leash")) return Cpu.LEASH;
 		if (name.startsWith("DrawMerge")) return Cpu.MERGE_ON;
 		if (name.startsWith("Model")) return Cpu.MODEL;
 		if (name.startsWith("EntityBox") || name.startsWith("EntityRendererBox")) return mcopt.metal.cpu.EntityBox.ON;

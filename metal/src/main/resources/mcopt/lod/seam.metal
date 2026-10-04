@@ -356,21 +356,24 @@ struct SeamTileFrame {
     float4 d0, dx, dy;
     float4 k0, kx, ky;
     float4 c;                // w: 1 when the history is valid
-    float4 params;           // x: alpha, y: box growth, z: mode (1: empty dispatch, 2: filter), w: 0
+    float4 params;           // x: alpha, y: box growth, z: mode (1: empty dispatch, 2: filter), w: frame number mod 64 (dither)
     uint4 dims;              // width, height, z: debug bits (1: no history sample, 2: no history write, 4: no neighbourhood,
-                             // 8: no reprojection, 16: return right after reading the pixel)
+                             // 8: no reprojection, 16: return right after reading the pixel, 64: no flat
+                             // skip, 128: no dither)
 };
 
 kernel void seam_tile(imageblock<SeamTileFrag, imageblock_layout_implicit> img, constant SeamTileFrame& f [[buffer(0)]],
-                      texture2d<half> hist [[texture(0)]], texture2d<half, access::write> next [[texture(1)]],
+                      texture2d<half> hist [[texture(0)]], texture2d<float, access::write> next [[texture(1)]],
                       ushort2 lid [[thread_position_in_threadgroup]], ushort2 tsize [[threads_per_threadgroup]],
                       uint2 gid [[thread_position_in_grid]]) {
     if (f.params.z < 1.5) return;
     half4 c = img.read(lid).color;
-    if ((f.dims.z & 16u) != 0u) return;
+    uint dbg = f.dims.z;
+    if ((dbg & 16u) != 0u) return;
     half4 lo = c, hi = c;
     bool far = c.a < 0.999h;
-    if (far && (f.dims.z & 4u) == 0u) {
+    if (far && (dbg & 4u) == 0u) {
+        // (a separable box over simd lanes measured no cheaper on the mini: the nine reads stay)
         for (int dy = -1; dy <= 1; dy++) {
             for (int dx = -1; dx <= 1; dx++) {
                 int2 q = clamp(int2(lid) + int2(dx, dy), int2(0), int2(tsize) - 1);
@@ -383,7 +386,9 @@ kernel void seam_tile(imageblock<SeamTileFrag, imageblock_layout_implicit> img, 
     threadgroup_barrier(mem_flags::mem_threadgroup_imageblock);
     if (!far || gid.x >= f.dims.x || gid.y >= f.dims.y) return;
     half3 res = c.rgb;
-    if (f.c.w > 0.0 && (f.dims.z & 8u) == 0u) {
+    // a flat box clamps the history to this pixel's own colour: the result is the colour itself, no need to fetch
+    bool flat = all(hi.rgb == lo.rgb) && (dbg & 64u) == 0u && (dbg & 4u) == 0u;
+    if (f.c.w > 0.0 && (dbg & 8u) == 0u && !flat) {
         float code = float(c.a) * 255.0;
         float dist = 256.0 * exp2((max(code, 1.0) - 1.0) * 8.0 / 253.0);
         float2 g = float2(gid);
@@ -392,7 +397,7 @@ kernel void seam_tile(imageblock<SeamTileFrag, imageblock_layout_implicit> img, 
         float3 q = (dist * rsqrt(dot(d, d))) * k + f.c.xyz;
         if (q.z > 1e-6) {
             float2 uv = q.xy / q.z;
-            if (all(uv > 0.0) && all(uv < 1.0) && (f.dims.z & 1u) == 0u) {
+            if (all(uv > 0.0) && all(uv < 1.0) && (dbg & 1u) == 0u) {
                 constexpr sampler lin(filter::linear, address::clamp_to_edge);
                 half3 h = hist.sample(lin, uv).rgb;
                 half3 grow = (hi.rgb - lo.rgb) * half(f.params.y);
@@ -404,5 +409,14 @@ kernel void seam_tile(imageblock<SeamTileFrag, imageblock_layout_implicit> img, 
     SeamTileFrag o;
     o.color = half4(res, 1.0h);
     img.write(o, lid);
-    if ((f.dims.z & 2u) == 0u) next.write(half4(res, 1.0h), gid);
+    if ((dbg & 2u) == 0u) {
+        // the history in 8 bits with a dithered rounding (interleaved gradient noise, moving each frame): at alpha 0.1 a
+        // plain rounding stops converging 5 steps short (0.9 h + 0.1 c rounds back to h), the dither keeps the mean moving
+        float3 hv = float3(res);
+        if ((dbg & 128u) == 0u) {
+            float2 pg = float2(gid) + 5.588238 * f.params.w;
+            hv += (fract(52.9829189 * fract(dot(pg, float2(0.06711056, 0.00583715)))) - 0.5) / 255.0;
+        }
+        next.write(float4(hv, 1.0), gid);
+    }
 }

@@ -33,6 +33,11 @@ final class LodMesh implements LodClip.Listener {
 	static final boolean REAL_OCC = Boolean.getBoolean("mcopt.lod.realOcc");
 	/** -Dmcopt.lod.realOccRule=height: a control, the earlier rule (the camera at or over a run's bottom), wrong under an arch. */
 	static final boolean REAL_OCC_HEIGHT = "height".equals(System.getProperty("mcopt.lod.realOccRule"));
+	/**
+	 * -Dmcopt.lod.hzMark=true (a debug mode, screenshots only): what the horizon would cull is drawn anyway, pure red (hidden
+	 * with its block) or green (hidden alone). Any red or green pixel left in the picture is far terrain wrongly culled.
+	 */
+	static final boolean HZ_MARK = Boolean.getBoolean("mcopt.lod.hzMark");
 	private static final int RING = 4;
 	/**
 	 * -Dmcopt.lod.dissolve=MS: a tile's first mesh in its slot dissolves in over MS ms, cell by cell, from the coarser level that
@@ -45,7 +50,9 @@ final class LodMesh implements LodClip.Listener {
 	static int clockMs() {
 		return (int) ((System.nanoTime() - CLOCK0) / 1_000_000L) & 0xFFFFFF;
 	}
-	private static final int MAX_INSTANCES = 1 << 19, MAX_PLANT_INSTANCES = 1 << 16, Q = 32;
+	/** The instance buffer: the culls' own instances, then (with the lists) their sectors' stand-ins from LodPk.STAND_BASE. */
+	static final int MAX_INSTANCES = LodPk.ENABLED ? 1 << 21 : 1 << 19;
+	private static final int MAX_PLANT_INSTANCES = 1 << 16, Q = 32;
 	private static final int SCRATCH_QUADS = 1 << 17;
 	/** Surviving quads a frame can draw (16-byte records). */
 	private static final int MAX_SURVIVORS = 1 << 21;
@@ -606,10 +613,11 @@ final class LodMesh implements LodClip.Listener {
 		MemoryUtil.memPutFloat(f + 112, maskOn ? maskDist : 0);
 		MemoryUtil.memPutInt(f + 128, this.tps);
 		MemoryUtil.memPutInt(f + 132, BLOCK);
-		MemoryUtil.memPutInt(f + 136, MAX_INSTANCES);
+		// (with the lists, the culls' own instances stay under their sectors' stand-ins, whichever path draws)
+		MemoryUtil.memPutInt(f + 136, LodPk.ENABLED ? LodPk.STAND_BASE : MAX_INSTANCES);
 		MemoryUtil.memPutInt(f + 140, MAX_PLANT_INSTANCES);
 		// the horizon cull: bands from 48 blocks, 128 of them out to twice the reach
-		MemoryUtil.memPutInt(f + 392, HORIZON ? (REAL_OCC ? (REAL_OCC_HEIGHT ? 49 : 17) : 1) : 0);
+		MemoryUtil.memPutInt(f + 392, HORIZON ? (REAL_OCC ? (REAL_OCC_HEIGHT ? 49 : 17) : 1) | (HZ_MARK ? 8 : 0) : 0);
 		MemoryUtil.memPutFloat(f + 400, 48.0F);
 		MemoryUtil.memPutFloat(f + 404, (float) (128.0 / Math.log(Math.max(2.0, reach * 2.0 / 48.0))));
 		MemoryUtil.memPutInt(f + 416, MAX_SURVIVORS);

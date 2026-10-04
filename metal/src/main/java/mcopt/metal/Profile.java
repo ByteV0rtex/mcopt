@@ -19,7 +19,7 @@ import java.util.TreeMap;
  * <li>A flag given on the command line wins over both: a key is only set when System.getProperty(key) is still null.</li>
  * </ul>
  * With no profile named anywhere, {@code alpha} applies (the perf-only set); {@code profile=none} applies no profile,
- * exactly the old no-profile behaviour. If config/mcopt.properties is absent it is written with {@code profile=alpha}
+ * exactly the old no-profile behaviour. If config/mcopt.properties is absent it is written with the effective profile ({@code alpha}, or what -Dmcopt.profile names)
  * and comment lines on how to turn it off and how to try far terrain. For {@code alpha} on the small tier (GPU under
  * 10 cores, or 8 GB of RAM or less, or either unreadable) the keys in {@link #SMALL_OUT} are left out. It runs first in every mixin config plugin
  * and in the preLaunch entrypoint, before any of our classes read a flag; the first call does the work, later calls
@@ -37,6 +37,29 @@ public final class Profile {
 	public static synchronized void apply() {
 		if (applied) return;
 		applied = true;
+		applyFlags();
+		distantHorizons();
+	}
+
+	/**
+	 * Distant Horizons casts the game's textures to OpenGL's (ClassCastException MetalTexture -> GlTexture in its Lightmap
+	 * mixin), so with DH loaded mcopt.metal defaults to false: OpenGL, exactly as -Dmcopt.metal=false. An explicit
+	 * mcopt.metal (command line or config/mcopt.properties, already applied above) wins.
+	 */
+	private static void distantHorizons() {
+		if (System.getProperty("mcopt.metal") != null) return;
+		boolean dh;
+		try {
+			dh = net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("distanthorizons");
+		} catch (Throwable t) {
+			return;
+		}
+		if (!dh) return;
+		System.setProperty("mcopt.metal", "false");
+		System.out.println("[mcopt] mcopt: Distant Horizons detected, using OpenGL; mcopt's other optimizations stay on (-Dmcopt.metal=true overrides)");
+	}
+
+	private static void applyFlags() {
 		Properties file = new Properties();
 		Path cfg = gameDir().resolve("config").resolve("mcopt.properties");
 		if (Files.isRegularFile(cfg)) {
@@ -45,11 +68,10 @@ public final class Profile {
 			} catch (IOException e) {
 				System.out.println("[mcopt] profile: can't read " + cfg + ": " + e);
 			}
-		} else if (!Files.exists(cfg)) {
-			writeDefault(cfg);
 		}
 		String name = System.getProperty("mcopt.profile", file.getProperty("profile", "")).trim();
 		if (name.isEmpty()) name = DEFAULT;
+		if (!Files.exists(cfg)) writeDefault(cfg, name); // first launch: record the effective profile (none stays none)
 		Map<String, String> flags = new TreeMap<>();
 		if (!name.isEmpty() && !name.equals("none")) {
 			Properties p = new Properties();
@@ -117,21 +139,21 @@ public final class Profile {
 		}
 	}
 
-	private static void writeDefault(Path cfg) {
+	private static void writeDefault(Path cfg, String name) {
 		String text = """
 			# mcopt settings. Written on first launch; edit freely.
 			#
-			# The alpha profile: measured vanilla performance options (chunk meshing, render lists, startup).
-			# To turn it off, change the next line to:  profile=none
-			profile=alpha
+			# profile=alpha: measured vanilla performance options (chunk meshing, render lists, startup), the default.
+			# To turn it off:  profile=none
+			profile=%s
 			#
 			# Far terrain (EXPERIMENTAL, off by default; for Macs with 10 or more GPU cores): remove the # below.
 			#mcopt.lod=true
-			""";
+			""".formatted(name);
 		try {
 			Files.createDirectories(cfg.getParent());
 			Files.writeString(cfg, text, StandardCharsets.UTF_8, java.nio.file.StandardOpenOption.CREATE_NEW, java.nio.file.StandardOpenOption.WRITE);
-			System.out.println("[mcopt] profile: wrote " + cfg + " (profile=alpha)");
+			System.out.println("[mcopt] profile: wrote " + cfg + " (profile=" + name + ")");
 		} catch (IOException e) {
 			System.out.println("[mcopt] profile: can't write " + cfg + ": " + e);
 		}

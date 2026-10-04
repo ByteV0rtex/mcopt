@@ -418,6 +418,8 @@ id<MTLDepthStencilState> mc_depth_state_new(Ctx *ctx, int compare, int write) {
 
 // ---- command encoding ----
 
+static int cpuAhead;  // opt-in (-Dmcopt.cpu.cmdAhead, mc_cpu_flags bit 1)
+
 Enc *mc_enc_new(Ctx *ctx) {
 	Enc *enc = calloc(1, sizeof(Enc));
 	enc->ctx = ctx;
@@ -425,6 +427,12 @@ Enc *mc_enc_new(Ctx *ctx) {
 }
 
 static id<MTLCommandBuffer> cmd(Enc *enc) {
+	if (!enc->cmd && enc->cpuNextPending) {  // opt-in (cmdAhead): the buffer made after the last commit
+		dispatch_semaphore_wait(enc->cpuNextReady, DISPATCH_TIME_FOREVER);
+		enc->cpuNextPending = 0;
+		enc->cmd = enc->cpuNext;
+		enc->cpuNext = nil;
+	}
 	if (!enc->cmd) {
 		@autoreleasepool {
 			enc->cmd = [[enc->ctx->queue commandBuffer] retain];
@@ -567,11 +575,24 @@ id<MTLCommandBuffer> mc_enc_commit(Enc *enc) {
 	if (diagOn) [c addCompletedHandler:^(id<MTLCommandBuffer> cb) { diagReport("main", n, t, big, mainBytes, cb); }];
 	[c commit];
 	enc->cmd = nil;
+	if (cpuAhead && !enc->cpuNextPending) {  // opt-in: queue order is commit order, not creation order
+		if (!enc->cpuNextReady) enc->cpuNextReady = dispatch_semaphore_create(0);
+		enc->cpuNextPending = 1;
+		id<MTLCommandQueue> queue = enc->ctx->queue;
+		dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+			@autoreleasepool {
+				enc->cpuNext = [[queue commandBuffer] retain];
+			}
+			dispatch_semaphore_signal(enc->cpuNextReady);
+		});
+	}
 	return c;
 }
 
 void mc_cmd_wait(id<MTLCommandBuffer> c) { [c waitUntilCompleted]; }
 int mc_cmd_done(id<MTLCommandBuffer> c) { return c.status >= MTLCommandBufferStatusCompleted; }
+// Nothing recorded since the last commit: no command buffer open (-Dmcopt.cpu.fence).
+int mc_enc_empty(Enc *enc) { return enc->cmd == nil && enc->pre == nil; }
 double mc_cmd_gpu_us(id<MTLCommandBuffer> c) { return (c.GPUEndTime - c.GPUStartTime) * 1e6; }
 double mc_cmd_gpu_end(id<MTLCommandBuffer> c) { return c.GPUEndTime; }
 double mc_cmd_gpu_start(id<MTLCommandBuffer> c) { return c.GPUStartTime; }
@@ -674,14 +695,61 @@ static int sameTargets(Enc *enc, int count, id<MTLTexture> const *colors, const 
 	return 1;
 }
 
+// opt-in (-Dmcopt.cpu.pass, set by mc_cpu_flags at device creation; off: everything below runs as before).
+// bit 0: foldDepthClear finds its pipeline by the attachments' pixel formats in a small table before building the string key
+// (the pipeline is the same object: the table only remembers what clearPipelines returned, and clearPipelines never drops an
+// entry); mc_render_begin fills one kept MTLRenderPassDescriptor, every field it may hold reset, instead of a new one per pass
+// (Metal copies the descriptor when it makes the encoder).
+static int cpuPass;
+
+void mc_cpu_flags(int flags) {
+	cpuPass = flags & 1;
+	cpuAhead = flags >> 1 & 1;
+}
+
+#define FOLD_SLOTS 16
+static struct {
+	Ctx *ctx;
+	MTLPixelFormat depth;
+	int count;
+	MTLPixelFormat colors[MAX_COLORS];
+	id<MTLRenderPipelineState> pso;  // not retained: owned by ctx->clearPipelines, which keeps every entry
+} foldSlots[FOLD_SLOTS];
+static int foldUsed;
+
+static id<MTLRenderPipelineState> foldFind(Enc *enc) {
+	MTLPixelFormat depth = enc->depth.pixelFormat;
+	for (int s = 0; s < foldUsed; s++) {
+		if (foldSlots[s].ctx != enc->ctx || foldSlots[s].depth != depth || foldSlots[s].count != enc->colorCount) continue;
+		int i = 0;
+		for (; i < enc->colorCount; i++) {
+			if (foldSlots[s].colors[i] != (enc->colors[i] ? enc->colors[i].pixelFormat : MTLPixelFormatInvalid)) break;
+		}
+		if (i == enc->colorCount) return foldSlots[s].pso;
+	}
+	return nil;
+}
+
+static void foldKeep(Enc *enc, id<MTLRenderPipelineState> pso) {
+	if (!pso || foldUsed == FOLD_SLOTS) return;
+	foldSlots[foldUsed].ctx = enc->ctx;
+	foldSlots[foldUsed].depth = enc->depth.pixelFormat;
+	foldSlots[foldUsed].count = enc->colorCount;
+	for (int i = 0; i < enc->colorCount; i++) foldSlots[foldUsed].colors[i] = enc->colors[i] ? enc->colors[i].pixelFormat : MTLPixelFormatInvalid;
+	foldSlots[foldUsed].pso = pso;
+	foldUsed++;
+}
+
 // Clears the open encoder's depth attachment in place with a depth-only full-screen triangle: cheaper than ending the encoder,
 // which would store every attachment and load them all back for the next pass.
 static void foldDepthClear(Enc *enc, float depthValue, int width, int height) {
 	Ctx *ctx = enc->ctx;
 	@autoreleasepool {
+		id<MTLRenderPipelineState> pso = cpuPass ? foldFind(enc) : nil;  // opt-in
+		if (!pso) {
 		NSMutableString *key = [NSMutableString stringWithFormat:@"fold %lu", (unsigned long) enc->depth.pixelFormat];
 		for (int i = 0; i < enc->colorCount; i++) [key appendFormat:@" %lu", (unsigned long) (enc->colors[i] ? enc->colors[i].pixelFormat : 0)];
-		id<MTLRenderPipelineState> pso = ctx->clearPipelines[(id) key];
+		pso = ctx->clearPipelines[(id) key];
 		if (!pso) {
 			MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor new] autorelease];
 			pd.vertexFunction = [[ctx->builtins newFunctionWithName:@"clear_vs"] autorelease];
@@ -694,6 +762,8 @@ static void foldDepthClear(Enc *enc, float depthValue, int width, int height) {
 			pso = [ctx->device newRenderPipelineStateWithDescriptor:pd error:nil];
 			ctx->clearPipelines[(id) key] = pso;
 			[pso release];
+		}
+		if (cpuPass) foldKeep(enc, pso);
 		}
 		struct { float color[4]; float depth; float pad[3]; } c = {{0}, depthValue, {0}};
 		[enc->render setRenderPipelineState:pso];
@@ -725,6 +795,41 @@ static void openRender(Enc *enc, MTLRenderPassDescriptor *rp) {
 	[enc->render setFrontFacingWinding:MTLWindingClockwise];  // vertex Y is flipped to keep GL/Vulkan row order, which mirrors winding too
 }
 
+// opt-in (cpuPass): enc's kept pass descriptor with every field mc_render_begin or openRender may have set on it
+// before back at its default, except the attachments this pass sets anyway (colors it names, depth when it has one).
+static MTLRenderPassDescriptor *keptPass(Enc *enc, int count, id<MTLTexture> const *colors, id<MTLTexture> depth) {
+	MTLRenderPassDescriptor *rp = enc->cpuPassDesc;
+	if (!rp) rp = enc->cpuPassDesc = [[MTLRenderPassDescriptor alloc] init];
+	int was = enc->cpuPassColors;
+	for (int i = 0; i < was; i++) {
+		if (i < count && colors[i]) continue;
+		MTLRenderPassColorAttachmentDescriptor *c = rp.colorAttachments[i];
+		c.texture = nil;
+		c.loadAction = MTLLoadActionDontCare;
+		c.storeAction = MTLStoreActionDontCare;
+		c.clearColor = MTLClearColorMake(0, 0, 0, 1);
+	}
+	enc->cpuPassColors = count;
+	if (!depth) {
+		MTLRenderPassDepthAttachmentDescriptor *d = rp.depthAttachment;
+		d.texture = nil;
+		d.loadAction = MTLLoadActionDontCare;
+		d.storeAction = MTLStoreActionDontCare;
+		d.clearDepth = 1.0;
+	}
+	rp.renderTargetWidth = 0;
+	rp.renderTargetHeight = 0;
+	rp.defaultRasterSampleCount = 0;
+	if (enc->cpuPassSampled) {
+		MTLRenderPassSampleBufferAttachmentDescriptor *sb = rp.sampleBufferAttachments[0];
+		sb.sampleBuffer = nil;
+		sb.startOfVertexSampleIndex = sb.endOfVertexSampleIndex = MTLCounterDontSample;
+		sb.startOfFragmentSampleIndex = sb.endOfFragmentSampleIndex = MTLCounterDontSample;
+		enc->cpuPassSampled = 0;
+	}
+	return rp;
+}
+
 /*
  * Starts a render pass. colors: `count` texture pointers (NULL = unused slot); clears: per color {doClear, r, g, b, a} as floats.
  * Region clears are expressed as a pass that loads, so partial clears go through mc_r_clear_rect.
@@ -744,7 +849,7 @@ int mc_render_begin(Enc *enc, int count, id<MTLTexture> const *colors, const flo
 	memcpy(enc->colors, colors, sizeof(id) * count);
 	enc->depth = depth;
 	@autoreleasepool {
-		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+		MTLRenderPassDescriptor *rp = cpuPass ? keptPass(enc, count, colors, depth) : [MTLRenderPassDescriptor renderPassDescriptor];  // opt-in
 		for (int i = 0; i < count; i++) {
 			if (!colors[i]) continue;
 			MTLRenderPassColorAttachmentDescriptor *c = rp.colorAttachments[i];
@@ -770,6 +875,7 @@ int mc_render_begin(Enc *enc, int count, id<MTLTexture> const *colors, const flo
 		enc->width = width;
 		enc->height = height;
 		openRender(enc, rp);
+		if (cpuPass && enc->samples) enc->cpuPassSampled = 1;
 	}
 	return 0;
 }
@@ -980,8 +1086,10 @@ void mc_layer_configure(Ctx *ctx, CAMetalLayer *layer, int width, int height, in
 	layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
 	layer.framebufferOnly = YES;
 	layer.drawableSize = CGSizeMake(width, height);
-	layer.displaySyncEnabled = vsync != 0;
-	layer.maximumDrawableCount = 3;
+	// vsync: bit 0 = display sync; bits 8-15 = maximumDrawableCount (0 = the default, 3; -Dmcopt.metal.drawables)
+	layer.displaySyncEnabled = (vsync & 1) != 0;
+	int drawables = (vsync >> 8) & 0xff;
+	layer.maximumDrawableCount = drawables == 2 || drawables == 3 ? drawables : 3;
 }
 
 // ---- present pacing ----
