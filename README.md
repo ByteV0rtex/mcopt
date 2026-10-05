@@ -40,7 +40,7 @@ fps spinning / flying, same test world, 1920x1080, render distance 16, VSync off
   `config/mcopt.properties` there.)
 - Far terrain is experimental. On Macs with fewer than 10 GPU cores, it costs most of the fps.
 - With fewer than 10 GPU cores, or 8 GB of memory or less, the profile leaves out the bigger chunk cache.
-- With Lithium, C2ME or ScalableLux installed, some of mcopt's chunk patches step aside on purpose.
+- With Lithium, C2ME, ScalableLux or Better Block Entities installed, some of mcopt's chunk patches step aside on purpose.
 
 ## Plans
 
