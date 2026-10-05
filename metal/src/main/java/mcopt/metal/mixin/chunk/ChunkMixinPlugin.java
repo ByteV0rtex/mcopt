@@ -26,7 +26,6 @@ public final class ChunkMixinPlugin implements IMixinConfigPlugin {
 		"DataLayerStorageMapMixin", List.of("scalablelux"),
 		"BlockLightMapMixin", List.of("scalablelux"),
 		"SkyLightMapMixin", List.of("scalablelux"),
-		"RegionFileStorageMixin", List.of("c2me"),
 		"PalettedContainerFactoryMixin", List.of("c2me"));
 
 	@Override public void onLoad(String mixinPackage) { }

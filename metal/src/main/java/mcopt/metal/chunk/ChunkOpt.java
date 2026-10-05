@@ -3,8 +3,6 @@ package mcopt.metal.chunk;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.LongAdder;
 
 /**
  * Opt-in chunk-pipeline and server-tick changes. Every switch is a -Dmcopt.chunk.NAME property; with none set no mixin
@@ -12,7 +10,8 @@ import java.util.concurrent.atomic.LongAdder;
  *
  * <ul>
  * <li>{@code saveSkip=probe|true} (C2): a chunk write whose bytes equal what the region file already holds, apart from the
- *     LastUpdate stamp, is skipped ({@code true}); {@code probe} compares and counts but always writes.</li>
+ *     LastUpdate stamp, is skipped ({@code true}); {@code probe} compares and counts but always writes. Its own Sodium-free
+ *     package and mixin config: mcopt.metal.chunkio, mcopt-metal-chunkio.mixins.json.</li>
  * <li>{@code mesh=air,bounds,vis,lambda} or {@code mesh=all} (C1, Sodium's meshers): empty neighbour sections share one AIR array
  *     instead of a 4096-entry fill (air); LevelSlice's volume check from three relative ranges in one branch (bounds); the
  *     section visibility graph by a bit-parallel sweep (vis); the two per-block method references of BlockRenderer.renderModel
@@ -30,16 +29,17 @@ import java.util.concurrent.atomic.LongAdder;
  * <li>{@code ticks=true} (D3): ServerLevel.tickChunk without per-pick overhead, same random ticks in the same order.</li>
  * <li>{@code chunkGet=true} (D2/D5): a chunk's section index offset computed once instead of per block access.</li>
  * <li>{@code light=true|verify} (C3): light section maps published as base + delta snapshots instead of full clones
- *     (LightSnapshots); verify checks every snapshot against vanilla's clone.</li>
+ *     (LightSnapshots); verify checks every snapshot against vanilla's clone. Off (one log line) when -Dmcopt.alloc.lightMap is
+ *     on: that one makes the same maps copy-on-write, and the two can't run together.</li>
  * <li>{@code stats=true}: count what the switches did (bench reports read {@link #snapshot()}).</li>
  * </ul>
  */
 public final class ChunkOpt {
 	private ChunkOpt() { }
 
-	public static final String SAVE_SKIP = prop("saveSkip");
-	public static final boolean SAVE_SKIP_ON = "true".equals(SAVE_SKIP);
-	public static final boolean SAVE_PROBE = "probe".equals(SAVE_SKIP);
+	public static final String SAVE_SKIP = mcopt.metal.chunkio.ChunkIo.SAVE_SKIP; // saveSkip lives in mcopt.metal.chunkio (no Sodium)
+	public static final boolean SAVE_SKIP_ON = mcopt.metal.chunkio.ChunkIo.SAVE_SKIP_ON;
+	public static final boolean SAVE_PROBE = mcopt.metal.chunkio.ChunkIo.SAVE_PROBE;
 	public static final java.util.Set<String> MESH = meshSet(prop("mesh"));
 	public static final int CLONES = Integer.getInteger("mcopt.chunk.clones", 0);
 	public static final boolean CLONES_VERIFY = Boolean.getBoolean("mcopt.chunk.clonesVerify");
@@ -56,10 +56,23 @@ public final class ChunkOpt {
 	public static final boolean POI = "true".equals(prop("poi")) || POI_VERIFY;
 	public static final boolean TICKS = Boolean.getBoolean("mcopt.chunk.ticks");
 	public static final boolean CHUNK_GET = Boolean.getBoolean("mcopt.chunk.chunkGet");
-	public static final boolean LIGHT_VERIFY = "verify".equals(prop("light"));
-	public static final boolean LIGHT = "true".equals(prop("light")) || LIGHT_VERIFY;
+	/**
+	 * -Dmcopt.alloc.lightMap makes the light engine's section map copy-on-write; light (below) replaces the same
+	 * snapshots with base + delta maps. The two can't run together (the integrated server crashed at world load), so with
+	 * alloc.lightMap on, light switches itself off and says so once.
+	 */
+	public static final boolean ALLOC_LIGHT_MAP = Boolean.getBoolean("mcopt.alloc.lightMap");
+	private static final boolean LIGHT_REQUESTED = "true".equals(prop("light")) || "verify".equals(prop("light"));
+	public static final boolean LIGHT_VERIFY = "verify".equals(prop("light")) && !ALLOC_LIGHT_MAP;
+	public static final boolean LIGHT = LIGHT_REQUESTED && !ALLOC_LIGHT_MAP;
 	public static final boolean STATS = Boolean.getBoolean("mcopt.chunk.stats") || SAVE_PROBE || PARSE_VERIFY || POI_VERIFY || CLONES_VERIFY || LIGHT_VERIFY || SERIALIZE_VERIFY
 		|| CLONES_CLEANUP_VERIFY || CLONES_CLEANUP_AB;
+
+	static {
+		if (LIGHT_REQUESTED && ALLOC_LIGHT_MAP) {
+			System.out.println("mcopt-chunk: light off: mcopt.alloc.lightMap is on (both replace the light engine's section-map copies; they can't run together)");
+		}
+	}
 
 	private static java.util.Set<String> meshSet(String v) {
 		java.util.Set<String> out = new java.util.TreeSet<>();
@@ -80,7 +93,6 @@ public final class ChunkOpt {
 	/** Whether the mixin named (simple class name) should apply: each one belongs to exactly one switch. */
 	public static boolean mixinEnabled(String simpleName) {
 		return switch (simpleName) {
-			case "RegionFileStorageMixin" -> SAVE_SKIP_ON || SAVE_PROBE;
 			case "LevelSliceAirMixin" -> mesh("air");
 			case "LevelSliceBoundsMixin" -> mesh("bounds");
 			case "DirectionalVisGraphMixin", "BitArrayAccessor" -> mesh("vis");
@@ -97,7 +109,6 @@ public final class ChunkOpt {
 		};
 	}
 
-	private static final Map<String, LongAdder> COUNTERS = new ConcurrentHashMap<>();
 
 	static {
 		// -Dmcopt.chunk.statsLog=true: the counters on stdout when the JVM exits (startup-only runs have no per-phase report).
@@ -107,7 +118,7 @@ public final class ChunkOpt {
 	}
 
 	public static void count(String key, long n) {
-		COUNTERS.computeIfAbsent(key, k -> new LongAdder()).add(n);
+		mcopt.metal.chunkio.ChunkIo.count(key, n); // one set of counters for every chunk switch
 	}
 
 	public static void count(String key) {
@@ -117,8 +128,9 @@ public final class ChunkOpt {
 	/** Cumulative counters since start, sorted by name (the bench stores one per phase and diffs them). */
 	public static Map<String, Object> snapshot() {
 		Map<String, Object> out = new LinkedHashMap<>();
-		out.put("flags", Map.of("saveSkip", SAVE_SKIP, "mesh", String.join(",", MESH), "clones", CLONES, "parse", PARSE, "clonesCleanup", CLONES_CLEANUP));
-		COUNTERS.entrySet().stream().sorted(Map.Entry.comparingByKey()).forEach(e -> out.put(e.getKey(), e.getValue().sum()));
+		out.put("flags", Map.of("saveSkip", SAVE_SKIP, "mesh", String.join(",", MESH), "clones", CLONES, "parse", PARSE, "clonesCleanup", CLONES_CLEANUP,
+			"light", LIGHT_VERIFY ? "verify" : LIGHT ? "true" : LIGHT_REQUESTED ? "off (alloc.lightMap)" : ""));
+		out.putAll(mcopt.metal.chunkio.ChunkIo.counters());
 		return out;
 	}
 }

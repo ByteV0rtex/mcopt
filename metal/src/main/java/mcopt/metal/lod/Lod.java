@@ -412,7 +412,14 @@ public final class Lod {
 		int rd = mc.options.getEffectiveRenderDistance();
 		if (LodGenStats.ON) LodGenStats.frame(mc.level, w, this.camX, this.camZ, rd);
 		if (LodYield.ON) LodYield.frame(mc, this.camX, this.camZ, rd);
-		if (HANDOFF_DRAWN && SODIUM) this.updateMaskDrawn(mc, rd);
+		if (HANDOFF_DRAWN && SODIUM) {
+			this.updateMaskDrawn(mc, rd);
+			if (CHUNK_HOLD) {
+				ClientLevel cl = mc.level;
+				w.hold = cl == null ? null : key -> this.heldInView((int) (key >> 32), (int) key, cl);
+				w.releaseHeld();
+			}
+		}
 		else this.updateMask(mc, rd, this.frames % 8 == 1);
 		this.partNanos[2] += System.nanoTime() - t2;
 		boolean probeOn = this.probe(start);
@@ -1002,14 +1009,42 @@ public final class Lod {
 	 */
 	private static final boolean MASK_FAST = !"false".equals(System.getProperty("mcopt.lod.maskFast"));
 	private static final boolean MASK_VERIFY = Boolean.getBoolean("mcopt.lod.maskVerify");
+	/**
+	 * -Dmcopt.lod.handoffUnseen=true: a chunk out of view (its column, grown by 32 blocks, outside this frame's frustum) is handed
+	 * off once its column is built, without waiting to be listed: when it turns into view the real terrain already draws it, so
+	 * the switch from far to real terrain never happens on screen. Chunks in view keep the two-walk rule (handing those off early
+	 * opens holes in flight). Default with -Dmcopt.lod.small (where the far terrain at the hand-off is 2-block cells).
+	 */
+	static final boolean HANDOFF_UNSEEN = Boolean.parseBoolean(System.getProperty("mcopt.lod.handoffUnseen", String.valueOf(LodConfig.SMALL)));
+
+	/**
+	 * -Dmcopt.lod.chunkHold=true (default with lod.small): a real chunk's rewrite of the coarser levels waits while the chunk is in
+	 * view and not handed off (LodField.applyChunk): at lod.small's n 512 level 1 meets the hand-off, and the rewrite would pop.
+	 */
+	static final boolean CHUNK_HOLD = Boolean.parseBoolean(System.getProperty("mcopt.lod.chunkHold", String.valueOf(LodConfig.SMALL)));
+
+	/** In this frame's mask window, not handed off, and in view (its column grown by 32 blocks meets the frustum). */
+	private boolean heldInView(int cx, int cz, ClientLevel level) {
+		int mx = cx - this.readyX, mz = cz - this.readyZ;
+		if (this.readyX == Integer.MIN_VALUE || mx < 0 || mz < 0 || mx >= this.readySize || mz >= this.readySize) return false;
+		if (this.handed[mz * MASK_MAX + mx]) return false;
+		return !this.unseen(cx * 16, cz * 16, level);
+	}
+
+	private boolean unseen(int ox, int oz, ClientLevel level) {
+		float g = 32;
+		return !this.frustum.testAab((float) (ox - this.camX) - g, (float) (level.getMinY() - this.camY), (float) (oz - this.camZ) - g,
+			(float) (ox + 16 - this.camX) + g, (float) (level.getMaxY() - this.camY), (float) (oz + 16 - this.camZ) + g);
+	}
+
 	/** -Dmcopt.lod.handoffPush=K: far terrain's clip depth times K (see source()); 0: off. */
 	static final float HANDOFF_PUSH = Float.parseFloat(System.getProperty("mcopt.lod.handoffPush", LodConfig.SMALL ? "0.9995" : "0"));
 	/**
-	 * -Dmcopt.lod.maskSpread=true (opt-in: not frame-identical): the deep chunks' "still built" re-check (every
+	 * -Dmcopt.lod.maskSpread (default true; =false: all in one frame as before): the deep chunks' "still built" re-check (every
 	 * 64 frames) spread over the 64 frames by position instead of all in one frame (~700 Sodium lookups at once: a 0.2-0.9 ms
 	 * render-thread frame every 64 at 5K, RD 16). Same rate per chunk; which frame a given chunk is re-checked on differs.
 	 */
-	private static final boolean MASK_SPREAD = Boolean.getBoolean("mcopt.lod.maskSpread");
+	private static final boolean MASK_SPREAD = !"false".equals(System.getProperty("mcopt.lod.maskSpread"));
 	private final int[] maskPrev = new int[MASK_MAX * MASK_MAX / 32];
 	private final boolean[] handedPrev = new boolean[MASK_MAX * MASK_MAX];
 	/** Per region footprint (8 x 8 chunks, from the window's corner - 8): 0 not asked yet this walk, 1 needed, 2 not. */
@@ -1182,7 +1217,7 @@ public final class Lod {
 				if (this.handed[k] && (deep ? (MASK_SPREAD ? (this.frames + k) % 64 != 1 : !full) : (this.frames + k) % 16 != 0)) {
 					// handed: built stays built (checked again every 16 frames in the outer ring, 64 deep inside; an unload
 					// clears it at once, see unloaded)
-				} else if (this.handed[k] || this.listedRun[k] >= HANDOFF_FRAMES) {
+				} else if (this.handed[k] || this.listedRun[k] >= HANDOFF_FRAMES || HANDOFF_UNSEEN && (this.frames + k) % 4 == 0 && this.unseen(ox, oz, level)) {
 					long b0 = LodConfig.STATS ? System.nanoTime() : 0;
 					this.handed[k] = this.builtColumn(level, sodium, cx, cz);
 					if (LodConfig.STATS) {
@@ -1326,7 +1361,8 @@ public final class Lod {
 			this.statFrames, this.statCpuNanos / 1e6 / this.statFrames, this.lastColumns, this.lastR0, this.lastR1, w.needed, w.missing, w.generated.get(),
 			w.generated.get() == 0 ? 0 : w.genNanos.get() / 1e6 / w.generated.get(), w.loaded.get(), w.pendingJobs(), w.queued(), w.chunksSummarized.get(),
 			this.nearestFar, w.settled ? String.format("%.1fs", (w.settledNanos - w.startNanos) / 1e9) : "no",
-			LodField.CHUNK_TILES ? String.format(", chunk tiles %d (generations skipped %d)", w.chunkTiles.get(), w.chunkSkipped.get()) : "");
+			(LodField.CHUNK_TILES ? String.format(", chunk tiles %d (generations skipped %d)", w.chunkTiles.get(), w.chunkSkipped.get()) : "")
+				+ (CHUNK_HOLD ? String.format(", chunks held %d (released %d)", w.heldCount(), w.heldReleased) : ""));
 		StringBuilder gen = new StringBuilder();
 		for (int i = 0; i < 16; i++) {
 			long n = w.noise.stageNanos.get(i * 4 + 3);

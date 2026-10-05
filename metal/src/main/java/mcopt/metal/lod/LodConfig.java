@@ -11,8 +11,9 @@ public final class LodConfig {
 	 * -Dmcopt.lod.small=true: far terrain for small GPUs (a MacBook Neo's 5 cores). Its cost there is
 	 * geometry (the GPU cull and its survivors' quads), not pixels, so this mode culls and draws fewer cells: a quarter-size
 	 * clipmap window (lod.n 512: level 0 to ~190 blocks, inside a 16-chunk render distance, so the far terrain starts with
-	 * 2-block cells), with level 1 keeping what level 0 has at the hand-off: crowns floating over their ground and the game's
-	 * own trees (crownLevels 2, treeLevels 2); and the hand-off's depth push (lod.handoffPush 0.9995). Each can still be set
+	 * 2-block cells), with crowns floating over their ground on level 1 too (crownLevels 2); the hand-off's depth push
+	 * (lod.handoffPush 0.9995), out-of-view chunks handed off once built (lod.handoffUnseen), and a real chunk's rewrite of
+	 * the coarser levels held while it's in view and not handed off (lod.chunkHold). Each can still be set
 	 * on its own; an explicit flag wins.
 	 */
 	public static final boolean SMALL = Boolean.getBoolean("mcopt.lod.small");
@@ -61,7 +62,7 @@ public final class LodConfig {
 	 * terrain); coarser levels the biome's impostor canopy. Level 1 needs every chunk's block-exact ground: ~5x the work of
 	 * its tiles. Default 1.
 	 */
-	public static final int TREE_LEVELS = Integer.getInteger("mcopt.lod.treeLevels", SMALL ? 2 : 1);
+	public static final int TREE_LEVELS = Integer.getInteger("mcopt.lod.treeLevels", 1);
 	/** -Dmcopt.lod.crownShade=F: sky light factor under tree crowns (the game's sky light drops under leaves). */
 	public static final double CROWN_SHADE = Double.parseDouble(System.getProperty("mcopt.lod.crownShade", "0.7"));
 	/**

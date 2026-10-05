@@ -2,7 +2,7 @@ plugins {
 	id 'net.fabricmc.fabric-loom' version "${loom_version}"
 }
 
-version = '0.2.0-alpha.2'
+version = '0.2.0-alpha.3'
 
 repositories {
 	// Sodium at build time only (compileOnly): mcopt hooks into it at runtime and never bundles it.

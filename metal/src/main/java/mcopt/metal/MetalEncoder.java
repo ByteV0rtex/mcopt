@@ -43,6 +43,13 @@ final class MetalEncoder implements CommandEncoderBackend {
 	private static final long CPU_COPY_MAX = 256 << 10;
 	private static final int PROFILE_FRAMES = 100, PROFILE_ENCODERS = 16;
 	private static final boolean GPU_TIMES = Boolean.getBoolean("mcopt.metal.gpuTimes");
+	/**
+	 * -Dmcopt.metal.presentQueue=true (idea: ByteV0rtex, noahdunnagan/mcopt#2): present from a second command queue, so the frame's
+	 * command buffer, which the render thread waits on, never touches the drawable (mc_present_queued in mcmetal.m).
+	 */
+	static final boolean PRESENT_QUEUE = "true".equals(System.getProperty("mcopt.metal.presentQueue")) || "acquire".equals(System.getProperty("mcopt.metal.presentQueue"));
+	/** -Dmcopt.metal.presentQueue=acquire: also acquire the drawable on the present side, so the render thread never waits in nextDrawable. */
+	static final boolean PRESENT_ACQUIRE = "acquire".equals(System.getProperty("mcopt.metal.presentQueue"));
 	private static final boolean STATS = Boolean.getBoolean("mcopt.metal.stats");
 
 	final long ctx;
@@ -160,8 +167,9 @@ final class MetalEncoder implements CommandEncoderBackend {
 		if (this.statStart == 0) this.statStart = now;
 		if (now - this.statStart < 1_000_000_000L) return;
 		double frameMs = (now - this.statStart) / 1e6 / this.statFrames;
-		System.out.printf("mcopt-metal stats: %d fps, %.3f ms/frame, %.3f ms of it waiting on the GPU, %d presents%n", this.statFrames,
-			frameMs, this.waitNanos / 1e6 / this.statFrames, this.statPresents);
+		System.out.printf("mcopt-metal stats: %d fps, %.3f ms/frame, %.3f ms of it waiting on the GPU, %d presents%s%n", this.statFrames,
+			frameMs, this.waitNanos / 1e6 / this.statFrames, this.statPresents, (PRESENT_QUEUE ? " (queued" + (PRESENT_ACQUIRE ? ", acquired on the present side" : "") + "; skipped so far " + Native.presentSkipped() + ", dropped " + Native.presentDropped() + ")" : "")
+			+ (MetalSurface.PACE_ADAPT ? String.format(" (pace margin +%.2f ms learned)", Native.paceExtraMs()) : ""));
 		if (MetalTerrain.OCC) {
 			long[] t = this.terrain.lastCompletedCounts();
 			System.out.printf("mcopt-metal stats: terrain drew %d of %d quads (%.1f%%), %d before the split, %d chunks (%.1f quads each), %d frames drew terrain%n", t[0], t[1],
@@ -591,13 +599,33 @@ final class MetalEncoder implements CommandEncoderBackend {
 	public void writeTimestamp(GpuQueryPool pool, int index) {
 	}
 
+	/** -Dmcopt.metal.presentQueue=acquire: this frame's image goes to a staging slot; the present side acquires the drawable and presents it. */
+	void presentAcquire(long layer, GpuTextureView view) {
+		MetalEvents.Operation event = MetalEvents.begin("present", this.submitIndex, 0);
+		try {
+			this.trace("present", view);
+			this.flushClear(view.texture());
+			if (Native.presentQueuedAcquire(this.enc, layer, ((MetalTexture.View) view).handle, GPU_TIMES && this.submitIndex < Integer.MAX_VALUE ? this.submitIndex : -1) == 0) return;
+			if (GPU_TIMES) GpuTimes.presentQueued(this.submitIndex);
+			this.statPresents++;
+		} finally {
+			MetalEvents.end(event);
+		}
+	}
+
 	void presentTexture(long drawable, GpuTextureView view) {
 		MetalEvents.Operation event = MetalEvents.begin("present", this.submitIndex, 0);
 		try {
 			this.trace("present", view);
 			this.flushClear(view.texture());
-			if (GPU_TIMES) GpuTimes.present(this.submitIndex, drawable);
-			Native.present(this.enc, drawable, ((MetalTexture.View) view).handle);
+			if (PRESENT_QUEUE) {
+				// the frame's command buffer only fills a staging slot; the present goes out on a second queue after the commit
+				if (Native.presentQueued(this.enc, drawable, ((MetalTexture.View) view).handle) == 0) return; // slot still being read: skip
+				if (GPU_TIMES) GpuTimes.present(this.submitIndex, drawable);
+			} else {
+				if (GPU_TIMES) GpuTimes.present(this.submitIndex, drawable);
+				Native.present(this.enc, drawable, ((MetalTexture.View) view).handle);
+			}
 			this.statPresents++;
 		} finally {
 			MetalEvents.end(event);

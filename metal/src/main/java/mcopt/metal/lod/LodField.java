@@ -361,8 +361,44 @@ final class LodField {
 
 	/** Writes a chunk's columns into every resident tile that covers it: level 0 every column, coarser at sample points. */
 	private void applyChunk(LodChunks.Summary s) {
+		// -Dmcopt.lod.chunkHold: a chunk in view and not handed off yet keeps its coarser levels as they are for now (a rewrite
+		// there would show); they're written once it's handed off or out of view (releaseHeld)
+		java.util.function.LongPredicate hold = this.hold;
+		long ck = LodForest.chunkKey(s.chunkX(), s.chunkZ());
+		if (hold != null && this.clip.levels > 1 && hold.test(ck)) {
+			this.applyChunk(s, 0, 1);
+			this.held.put(ck, s);
+			return;
+		}
+		this.held.remove(ck);
+		this.applyChunk(s, 0, this.clip.levels);
+	}
+
+	/** -Dmcopt.lod.chunkHold: Lod's test (chunk in view, not handed off); null: off. Render thread. */
+	java.util.function.@org.jspecify.annotations.Nullable LongPredicate hold;
+	private final java.util.HashMap<Long, LodChunks.Summary> held = new java.util.HashMap<>();
+	long heldReleased;
+
+	/** Render thread, once a frame after the mask: the held chunks whose coarser levels can be written now. */
+	void releaseHeld() {
+		java.util.function.LongPredicate hold = this.hold;
+		if (this.held.isEmpty() || hold == null) return;
+		for (var it = this.held.entrySet().iterator(); it.hasNext();) {
+			var e = it.next();
+			if (hold.test(e.getKey())) continue;
+			it.remove();
+			this.applyChunk(e.getValue(), 1, this.clip.levels);
+			this.heldReleased++;
+		}
+	}
+
+	int heldCount() {
+		return this.held.size();
+	}
+
+	private void applyChunk(LodChunks.Summary s, int fromLevel, int toLevel) {
 		int bx = s.chunkX() * 16, bz = s.chunkZ() * 16;
-		for (int level = 0; level < this.clip.levels; level++) {
+		for (int level = fromLevel; level < toLevel; level++) {
 			int span = this.clip.span(level);
 			int tx = Math.floorDiv(bx, span), tz = Math.floorDiv(bz, span);
 			if (!this.clip.resident(level, tx, tz)) {

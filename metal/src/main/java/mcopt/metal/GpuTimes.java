@@ -44,6 +44,12 @@ public final class GpuTimes {
 		if (pollNs != null) pollNs[(int) index] = Latency.lastPollNs;
 		Native.cadencePresent(drawable, (int) index);
 	}
+	/** A present whose drawable is acquired on the present side (presentQueue=acquire): native registers the scanout probe. */
+	static void presentQueued(long index) {
+		if (index >= CAPACITY) return;
+		presenting[(int) index] = true;
+		if (pollNs != null) pollNs[(int) index] = Latency.lastPollNs;
+	}
 	static void retire(long index, long cmd) {
 		if (index >= CAPACITY) { dropped++; return; }
 		int i = (int) index;

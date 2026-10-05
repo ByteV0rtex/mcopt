@@ -1,6 +1,7 @@
 // Thin C surface over Metal for the Java backend (called through java.lang.foreign).
 // Objects cross the boundary as retained pointers; Java owns them and hands them back to mc_release.
 // Built without ARC so ownership is explicit. Hot encoder calls allocate nothing, so they need no autorelease pool.
+#include <stdatomic.h>
 #import "mcmetal.h"
 #import <CoreVideo/CoreVideo.h>
 #import <MetalFX/MetalFX.h>
@@ -548,6 +549,8 @@ void mc_pre_fill(Enc *enc, id<MTLBuffer> buffer, uint64_t offset, uint64_t lengt
 	[preBlit(enc) fillBuffer:buffer range:NSMakeRange(offset, length) value:(uint8_t) value];
 }
 
+static void pqSubmit(void);
+
 // Commits everything recorded so far (the pre command buffer first). Returns the retained main command buffer so Java can
 // wait on it (frame pacing, fences); it completes after the pre one.
 id<MTLCommandBuffer> mc_enc_commit(Enc *enc) {
@@ -586,6 +589,7 @@ id<MTLCommandBuffer> mc_enc_commit(Enc *enc) {
 			dispatch_semaphore_signal(enc->cpuNextReady);
 		});
 	}
+	pqSubmit();  // -Dmcopt.metal.presentQueue: the present this frame encoded (nothing without the flag)
 	return c;
 }
 
@@ -1126,19 +1130,46 @@ static void startDisplayLink(void) {
 // 1 if this frame should be presented: it is the first to make some refresh, and the next one, allowing it twice the
 // usual frame interval, would miss it. Frame times jitter, so with one interval of slack the frame after a skip often came
 // in late and ~1 refresh in 11 got nothing new (55.6 presents/s at 60 Hz); two give 59.7 at the same fps.
+// -Dmcopt.metal.paceAdapt (opt-in): the margin learns the compositor's latch from scanout times. Every paced present registers
+// a presented handler with the refresh it was aimed at (paceTarget). If the frame reached the screen more than half a refresh
+// after that, it missed the latch (on the laptop's 120 Hz panel such a frame shows a refresh late, or ~1.9 ms after the next
+// refresh, right before its successor: the paired presents of LATENCY.md lt4), and the lead grows by PACE_UP; a frame on time
+// shrinks it by PACE_DOWN. That settles at about PACE_DOWN / PACE_UP (2%) late frames, just at the latch deadline. Without
+// scanout times (presentedTime 0, as on the mini's display) nothing changes: the margin stays the caller's.
+static int paceAdapt;
+static _Atomic double paceExtra;  // seconds added to the caller's margin
+static double paceTarget;         // the refresh the frame being presented was paced for (render thread)
+#define PACE_UP 0.00025
+#define PACE_DOWN 0.000005
+#define PACE_EXTRA_MAX 0.006
+void mc_pace_adapt(int on) { paceAdapt = on; }
+double mc_pace_extra_ms(void) { return paceExtra * 1e3; }
+static void paceWatch(id<CAMetalDrawable> drawable) {
+	if (!paceAdapt || paceTarget <= 0) return;
+	double target = paceTarget, period = refreshPeriod;
+	[drawable addPresentedHandler:^(id<MTLDrawable> d) {
+		double shown = d.presentedTime;
+		if (shown <= 0 || period <= 0) return;
+		double e = paceExtra;
+		e = shown - target > period * 0.5 ? e + PACE_UP : e - PACE_DOWN;
+		paceExtra = e < 0 ? 0 : e > PACE_EXTRA_MAX ? PACE_EXTRA_MAX : e;
+	}];
+}
+
 int mc_pace(double margin) {
 	static int started;
 	if (!started) {
 		started = 1;
 		startDisplayLink();
 	}
-	double now = CACurrentMediaTime(), anchor = nextRefresh, period = refreshPeriod, lead = gpuLatency + margin;
+	double now = CACurrentMediaTime(), anchor = nextRefresh, period = refreshPeriod, lead = gpuLatency + margin + paceExtra;
 	if (lastPace > 0) frameInterval += (now - lastPace - frameInterval) * 0.1;
 	lastPace = now;
 	if (period <= 0 || now - anchor > 0.25) return 1; // no refreshes lately (starting, display asleep): present everything
 	double target = anchor + ceil((now + lead - anchor) / period) * period;
 	if (target < pacedFor + period / 2 || now + 2 * frameInterval + lead < target) return 0;
 	pacedFor = target;
+	paceTarget = target;
 	return 1;
 }
 
@@ -1181,9 +1212,176 @@ void mc_present(Enc *enc, id<CAMetalDrawable> drawable, id<MTLTexture> src) {
 		[r endEncoding];
 		double encodedAt = CACurrentMediaTime();
 		[cmd(enc) addCompletedHandler:^(id<MTLCommandBuffer> b) { gpuLatency += (CACurrentMediaTime() - encodedAt - gpuLatency) * 0.1; }];
+		paceWatch(drawable);
 		[cmd(enc) presentDrawable:drawable];
 	}
 }
+
+// ---- present off the frame's command buffer (opt-in: -Dmcopt.metal.presentQueue) ----
+// Idea: ByteV0rtex, noahdunnagan/mcopt#2. mc_present encodes the drawable's draw and presentDrawable into the frame's own
+// command buffer, so the frame's completion, which the render thread waits on (MAX_IN_FLIGHT retire, the uniform ring's
+// fences), is tied to the drawable. Here the frame's command buffer only copies the finished image into a staging slot and
+// signals pqEvent; once the frame is committed, a command buffer on a second queue waits for that signal, draws the slot into
+// the drawable and presents it. Staging slots are fenced: a slot is busy from the frame that fills it until the present
+// command buffer that reads it completes (its completed handler clears the flag). If the next slot is still busy, the frame
+// skips its present (returns 0) instead of waiting, so the render thread never blocks here and no slot is overwritten while
+// it is read. Single caller (the render thread); the handlers only touch atomics.
+#define PQ_SLOTS 3
+static id<MTLCommandQueue> pqQueue;
+static id<MTLEvent> pqEvent;
+static uint64_t pqValue;
+static id<MTLTexture> pqStaging[PQ_SLOTS];
+static _Atomic int pqBusy[PQ_SLOTS];
+static int pqNext;
+static id<CAMetalDrawable> pqDrawable;  // retained: encoded by mc_present_queued, presented by pqSubmit after the commit
+static int pqSlot;
+static uint64_t pqWait;
+static _Atomic long pqSkipped;
+static Ctx *pqCtx;
+
+// Fills the next staging slot with src in the frame's command buffer and signals pqEvent; the slot index, or -1 if that slot
+// is still being read by an earlier present (the caller skips this frame's present).
+static int pqFill(Enc *enc, id<MTLTexture> src) {
+	endBlit(enc);
+	endRender(enc);
+	Ctx *ctx = pqCtx = enc->ctx;
+	int k = pqNext;
+	if (atomic_load(&pqBusy[k])) {
+		atomic_fetch_add(&pqSkipped, 1);
+		return -1;
+	}
+	@autoreleasepool {
+		if (!pqQueue) {
+			pqQueue = [ctx->device newCommandQueue];
+			pqEvent = [ctx->device newEvent];
+		}
+		id<MTLTexture> st = pqStaging[k];
+		if (!st || st.width != src.width || st.height != src.height || st.pixelFormat != src.pixelFormat) {
+			[st release];  // not busy: the present that read it has completed
+			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:src.width height:src.height mipmapped:NO];
+			d.usage = MTLTextureUsageShaderRead;
+			d.storageMode = MTLStorageModePrivate;
+			st = pqStaging[k] = [ctx->device newTextureWithDescriptor:d];
+		}
+		atomic_store(&pqBusy[k], 1);
+		pqNext = (k + 1) % PQ_SLOTS;
+		id<MTLBlitCommandEncoder> b = [cmd(enc) blitCommandEncoder];
+		[b copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(src.width, src.height, 1)
+			toTexture:st destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+		[b endEncoding];
+		[cmd(enc) encodeSignalEvent:pqEvent value:++pqValue];
+	}
+	return k;
+}
+
+// Draws staging slot `slot` into `drawable` on a pqQueue command buffer that first waits for the slot's fill, presents it,
+// and frees the slot when the GPU is done with it.
+static void pqEncodePresent(id<CAMetalDrawable> drawable, int slot, uint64_t wait, double queuedAt) {
+	Ctx *ctx = pqCtx;
+	id<MTLCommandBuffer> p = [pqQueue commandBuffer];
+	[p encodeWaitForEvent:pqEvent value:wait];
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = drawable.texture;
+	rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	id<MTLRenderCommandEncoder> r = [p renderCommandEncoderWithDescriptor:rp];
+	[r setRenderPipelineState:ctx->present];
+	[r setFragmentTexture:pqStaging[slot] atIndex:0];
+	[r setFragmentSamplerState:ctx->presentSampler atIndex:0];
+	[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[r endEncoding];
+	[p addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+		gpuLatency += (CACurrentMediaTime() - queuedAt - gpuLatency) * 0.1;
+		atomic_store(&pqBusy[slot], 0);
+	}];
+	paceWatch(drawable);
+	[p presentDrawable:drawable];
+	[p commit];
+}
+
+int mc_present_queued(Enc *enc, id<CAMetalDrawable> drawable, id<MTLTexture> src) {
+	int k = pqFill(enc, src);
+	if (k < 0) return 0;
+	if (pqDrawable) {  // a present encoded but not yet submitted (two in one frame): the newer one wins, free the older slot
+		[pqDrawable release];
+		atomic_store(&pqBusy[pqSlot], 0);
+	}
+	pqDrawable = [drawable retain];
+	pqSlot = k;
+	pqWait = pqValue;
+	return 1;
+}
+
+// -Dmcopt.metal.presentQueue=acquire: the drawable is acquired on the present side too, so the render thread never waits in
+// nextDrawable. The frame hands its filled slot to pqWorker (a serial queue at user-interactive QoS) after its commit; the
+// worker acquires the drawable, registers the scanout probe and encodes the present. One hand-off is held at a time: a
+// newer frame's replaces one the worker hasn't taken yet (the older slot is freed, counted in pqDropped).
+static dispatch_queue_t pqWorker;
+static _Atomic uint64_t pqHandoff;  // fill value << 2 | slot; 0 = none
+static _Atomic int pqScheduled;
+static _Atomic long pqDropped;
+static CAMetalLayer *pqLayer;
+static long pqCadence[PQ_SLOTS];
+static double pqQueuedAt[PQ_SLOTS];
+static uint64_t pqAcq;  // this frame's hand-off, published by pqSubmit after the commit
+void mc_cadence_present(id<CAMetalDrawable> drawable, int slot);
+
+int mc_present_queued_acquire(Enc *enc, CAMetalLayer *layer, id<MTLTexture> src, long cadence) {
+	int k = pqFill(enc, src);
+	if (k < 0) return 0;
+	if (pqAcq) atomic_store(&pqBusy[pqAcq & 3], 0);  // two presents in one frame: the newer one wins
+	pqLayer = layer;
+	pqCadence[k] = cadence;
+	pqQueuedAt[k] = CACurrentMediaTime();
+	pqAcq = pqValue << 2 | (uint64_t) k;
+	return 1;
+}
+
+static void pqWork(void) {
+	for (;;) {
+		atomic_store(&pqScheduled, 0);
+		uint64_t h = atomic_exchange(&pqHandoff, 0);
+		if (!h) return;
+		int slot = (int) (h & 3);
+		@autoreleasepool {
+			id<CAMetalDrawable> drawable = [pqLayer nextDrawable];
+			if (!drawable) {  // window hidden: drop this present
+				atomic_store(&pqBusy[slot], 0);
+				continue;
+			}
+			if (pqCadence[slot] >= 0) mc_cadence_present(drawable, (int) pqCadence[slot]);
+			pqEncodePresent(drawable, slot, h >> 2, pqQueuedAt[slot]);
+		}
+	}
+}
+
+static void pqPublish(void) {
+	uint64_t old = atomic_exchange(&pqHandoff, pqAcq);
+	pqAcq = 0;
+	if (old) {
+		atomic_store(&pqBusy[old & 3], 0);
+		atomic_fetch_add(&pqDropped, 1);
+	}
+	if (!atomic_exchange(&pqScheduled, 1)) {
+		if (!pqWorker) pqWorker = dispatch_queue_create("mcopt.present", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+		dispatch_async(pqWorker, ^{ pqWork(); });
+	}
+}
+
+long mc_present_dropped(void) { return atomic_load(&pqDropped); }
+
+// After the frame's command buffer is committed: the present command buffer on pqQueue (or the hand-off to pqWorker).
+static void pqSubmit(void) {
+	if (pqAcq) pqPublish();
+	if (!pqDrawable) return;
+	@autoreleasepool {
+		pqEncodePresent(pqDrawable, pqSlot, pqWait, CACurrentMediaTime());
+	}
+	[pqDrawable release];
+	pqDrawable = nil;
+}
+
+long mc_present_skipped(void) { return atomic_load(&pqSkipped); }
 
 // ---- MetalFX temporal upscaling ----
 

@@ -1,9 +1,9 @@
-package mcopt.metal.mixin.chunk;
+package mcopt.metal.mixin.chunkio;
 
 import java.io.DataInputStream;
 import java.io.IOException;
-import mcopt.metal.chunk.ChunkOpt;
-import mcopt.metal.chunk.RegionSkip;
+import mcopt.metal.chunkio.ChunkIo;
+import mcopt.metal.chunkio.RegionSkip;
 import net.minecraft.SharedConstants;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.world.level.ChunkPos;
@@ -46,7 +46,7 @@ abstract class RegionFileStorageMixin {
 				try (DataInputStream in = region.getChunkDataInputStream(pos)) {
 					if (in == null) {
 						result = RegionSkip.Result.NO_STORED;
-					} else if (ChunkOpt.SAVE_PROBE) {
+					} else if (ChunkIo.SAVE_PROBE) {
 						RegionSkip.readStored(buffers, in); // the whole stream, for the probe's diff of differing keys
 						result = RegionSkip.compare(buffers);
 					} else {
@@ -56,24 +56,24 @@ abstract class RegionFileStorageMixin {
 			}
 		} catch (IOException | RuntimeException e) {
 			// Can't prove anything: write as vanilla does.
-			ChunkOpt.count("save." + type + ".compareFailed");
+			ChunkIo.count("save." + type + ".compareFailed");
 			return;
 		}
 		long dt = System.nanoTime() - t0;
-		if (ChunkOpt.STATS) {
-			ChunkOpt.count("save." + type + ".writes");
-			ChunkOpt.count("save." + type + "." + result.name().toLowerCase(java.util.Locale.ROOT));
-			ChunkOpt.count("save." + type + ".compareNs", dt);
-			if (buffers != null) ChunkOpt.count("save." + type + ".bytes", buffers.storedLength);
-			if (ChunkOpt.SAVE_PROBE && result == RegionSkip.Result.DIFFERENT) {
-				for (String k : RegionSkip.diffKeys(buffers, value)) ChunkOpt.count("save." + type + ".diff." + k);
+		if (ChunkIo.STATS) {
+			ChunkIo.count("save." + type + ".writes");
+			ChunkIo.count("save." + type + "." + result.name().toLowerCase(java.util.Locale.ROOT));
+			ChunkIo.count("save." + type + ".compareNs", dt);
+			if (buffers != null) ChunkIo.count("save." + type + ".bytes", buffers.storedLength);
+			if (ChunkIo.SAVE_PROBE && result == RegionSkip.Result.DIFFERENT) {
+				for (String k : RegionSkip.diffKeys(buffers, value)) ChunkIo.count("save." + type + ".diff." + k);
 			}
 		}
-		if (ChunkOpt.SAVE_SKIP_ON && (result == RegionSkip.Result.IDENTICAL || result == RegionSkip.Result.LAST_UPDATE_ONLY)) {
+		if (ChunkIo.SAVE_SKIP_ON && (result == RegionSkip.Result.IDENTICAL || result == RegionSkip.Result.LAST_UPDATE_ONLY)) {
 			ci.cancel();
 			return;
 		}
-		if (ChunkOpt.STATS) MCOPT_WRITE_START.get()[0] = System.nanoTime();
+		if (ChunkIo.STATS) MCOPT_WRITE_START.get()[0] = System.nanoTime();
 	}
 
 	@Unique
@@ -82,11 +82,11 @@ abstract class RegionFileStorageMixin {
 	/** Stats only: what vanilla's own write (serialize + compress + region write) costs, for the probe's arithmetic. */
 	@Inject(method = "write", at = @At("RETURN"))
 	private void mcopt$timeWrite(ChunkPos pos, CompoundTag value, CallbackInfo ci) {
-		if (!ChunkOpt.STATS || value == null) return;
+		if (!ChunkIo.STATS || value == null) return;
 		long[] start = MCOPT_WRITE_START.get();
 		if (start[0] != 0) {
-			ChunkOpt.count("save." + this.info.type() + ".vanillaWriteNs", System.nanoTime() - start[0]);
-			ChunkOpt.count("save." + this.info.type() + ".vanillaWrites");
+			ChunkIo.count("save." + this.info.type() + ".vanillaWriteNs", System.nanoTime() - start[0]);
+			ChunkIo.count("save." + this.info.type() + ".vanillaWrites");
 			start[0] = 0;
 		}
 	}

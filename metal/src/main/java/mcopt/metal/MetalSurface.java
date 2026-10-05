@@ -20,6 +20,17 @@ final class MetalSurface implements GpuSurfaceBackend {
 	private static final double PACE_MARGIN_S = Double.parseDouble(System.getProperty("mcopt.metal.paceMarginMs", "2")) / 1000;
 	/** -Dmcopt.metal.drawables=2|3: the layer's maximumDrawableCount (default 3). */
 	private static final int DRAWABLES = Integer.getInteger("mcopt.metal.drawables", 0);
+	/**
+	 * -Dmcopt.metal.paceSync=true: the paced presents (vsync off) go out with display sync on, so each latches at a vblank. On
+	 * the laptop's 120 Hz 5K display at ~1800 fps, paced presents without display sync reach the screen in pairs ~1.9 ms apart
+	 * every 16.7 ms (a 60 Hz cadence); with vsync the grid is a clean 8.33 ms.
+	 */
+	private static final boolean PACE_SYNC = Boolean.getBoolean("mcopt.metal.paceSync");
+	/**
+	 * -Dmcopt.metal.paceAdapt=true: the pacer's margin learns the compositor's latch from scanout times (mc_pace in mcmetal.m): a
+	 * paced frame shown more than half a refresh after the refresh it was aimed at adds lead, a frame on time takes a little away.
+	 */
+	static final boolean PACE_ADAPT = Boolean.getBoolean("mcopt.metal.paceAdapt");
 	private boolean paced;
 	private final long ctx;
 	private final MetalEncoder encoder;
@@ -37,8 +48,9 @@ final class MetalSurface implements GpuSurfaceBackend {
 	public void configure(GpuSurface.Configuration config) {
 		boolean vsync = config.presentMode() == GpuSurface.PresentMode.FIFO;
 		// Frame generation schedules every present on the display's refresh grid, which needs vsync (FrameGen).
-		Native.layerConfigure(this.ctx, this.layer, config.width(), config.height(), (vsync || FrameGen.ENABLED ? 1 : 0) | DRAWABLES << 8);
 		this.paced = !vsync && PACE && !FrameGen.ENABLED;
+		if (PACE_ADAPT) Native.paceAdapt(this.paced ? 1 : 0);
+		Native.layerConfigure(this.ctx, this.layer, config.width(), config.height(), (vsync || FrameGen.ENABLED || PACE_SYNC && this.paced ? 1 : 0) | DRAWABLES << 8);
 	}
 
 	@Override
@@ -60,6 +72,10 @@ final class MetalSurface implements GpuSurfaceBackend {
 			return;
 		}
 		if (this.paced && !Native.pace(PACE_MARGIN_S)) return;
+		if (MetalEncoder.PRESENT_ACQUIRE) {
+			this.encoder.presentAcquire(this.layer, textureView); // no nextDrawable here: the present side acquires it
+			return;
+		}
 		MetalEvents.Operation event = MetalEvents.begin("nextDrawable", -1, 0);
 		long drawable;
 		try {

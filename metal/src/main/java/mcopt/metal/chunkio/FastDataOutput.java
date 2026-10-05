@@ -1,4 +1,4 @@
-package mcopt.metal.chunk;
+package mcopt.metal.chunkio;
 
 import java.io.DataOutput;
 import java.io.UTFDataFormatException;

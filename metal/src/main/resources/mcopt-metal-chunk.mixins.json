@@ -4,7 +4,6 @@
 	"plugin": "mcopt.metal.mixin.chunk.ChunkMixinPlugin",
 	"compatibilityLevel": "JAVA_25",
 	"client": [
-		"RegionFileStorageMixin",
 		"LevelSliceAirMixin",
 		"LevelSliceBoundsMixin",
 		"BitArrayAccessor",
