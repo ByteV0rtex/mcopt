@@ -1,5 +1,6 @@
 // Shared between mcmetal.m (the backend), mcterrain.m (terrain culling) and mcprobe.m (the debug visibility probe).
 #import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
 
 typedef struct {
 	id<MTLDevice> device;
@@ -11,6 +12,14 @@ typedef struct {
 	id<MTLDepthStencilState> depthWrite, depthKeep;
 	id<MTLBuffer> fanIndices;  // {0, k+1, k+2} per triangle: Metal has no fans, so they're drawn as indexed triangle lists
 	id<MTLComputePipelineState> motion;  // motion_cs, for the temporal upscaler
+	// The VSync-off present (mc_present): its own command queue, the events that order it against the frames, and the staging
+	// textures a frame hands its image over in, each with the presentEvent value at which the present queue is done reading it.
+	id<MTLCommandQueue> presentQueue;
+	id<MTLSharedEvent> frameEvent, presentEvent;
+	uint64_t frameValue, presentValue;
+	id<MTLTexture> presentStaging[3];
+	uint64_t presentStagingRead[3];
+	int presentNext;
 } Ctx;
 
 #define MAX_COLORS 8
@@ -55,6 +64,10 @@ typedef struct {
 	id<MTLCommandBuffer> cpuNext;
 	dispatch_semaphore_t cpuNextReady;
 	int cpuNextPending;
+	// The VSync-off present mc_present queued for this frame, sent to the present queue right after its commit (presentQueued).
+	id<CAMetalDrawable> presentDrawable;
+	int presentSlot;
+	uint64_t presentFrameValue;
 } Enc;
 
 id<MTLCommandBuffer> mc_pre(Enc *enc);

@@ -548,6 +548,8 @@ void mc_pre_fill(Enc *enc, id<MTLBuffer> buffer, uint64_t offset, uint64_t lengt
 	[preBlit(enc) fillBuffer:buffer range:NSMakeRange(offset, length) value:(uint8_t) value];
 }
 
+static void presentQueued(Enc *enc);
+
 // Commits everything recorded so far (the pre command buffer first). Returns the retained main command buffer so Java can
 // wait on it (frame pacing, fences); it completes after the pre one.
 id<MTLCommandBuffer> mc_enc_commit(Enc *enc) {
@@ -575,6 +577,7 @@ id<MTLCommandBuffer> mc_enc_commit(Enc *enc) {
 	if (diagOn) [c addCompletedHandler:^(id<MTLCommandBuffer> cb) { diagReport("main", n, t, big, mainBytes, cb); }];
 	[c commit];
 	enc->cmd = nil;
+	presentQueued(enc);
 	if (cpuAhead && !enc->cpuNextPending) {  // opt-in: queue order is commit order, not creation order
 		if (!enc->cpuNextReady) enc->cpuNextReady = dispatch_semaphore_create(0);
 		enc->cpuNextPending = 1;
@@ -1164,25 +1167,90 @@ id<CAMetalDrawable> mc_layer_next(CAMetalLayer *layer) {
 	}
 }
 
-// Draws src into the drawable (flipped back to top-down) and schedules the present on the current command buffer.
+// Draws src into the drawable (flipped back to top-down).
+static void drawPresent(id<MTLCommandBuffer> cb, Ctx *ctx, id<CAMetalDrawable> drawable, id<MTLTexture> src) {
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = drawable.texture;
+	rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	id<MTLRenderCommandEncoder> r = [cb renderCommandEncoderWithDescriptor:rp];
+	[r setRenderPipelineState:ctx->present];
+	[r setFragmentTexture:src atIndex:0];
+	[r setFragmentSamplerState:ctx->presentSampler atIndex:0];
+	[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[r endEncoding];
+}
+
+// Presents src in the drawable. With VSync off the present goes through a queue of its own: a command buffer that draws into
+// a drawable can't complete until the display releases one, and the game waits on recent frames (vanilla's
+// MappableRingBuffer on the submit three rotations back, frame pacing on N-2), so presenting from the frame's command buffer
+// stalled the render thread for up to a refresh whenever the compositor still held every drawable (~47 frames a second of
+// 5-8 ms on a 144 Hz display). Instead the frame copies its image into a staging texture and signals frameEvent; after the
+// frame's commit, a command buffer on presentQueue waits for that, draws the staging texture into the drawable, presents it
+// and signals presentEvent, which a frame waits for before it reuses that staging texture (three presents later, so in
+// practice it never waits). With VSync on, waiting for the display is the point: the frame presents directly.
 void mc_present(Enc *enc, id<CAMetalDrawable> drawable, id<MTLTexture> src) {
 	endBlit(enc);
 	endRender(enc);
+	Ctx *ctx = enc->ctx;
 	@autoreleasepool {
-		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
-		rp.colorAttachments[0].texture = drawable.texture;
-		rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
-		rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-		id<MTLRenderCommandEncoder> r = [cmd(enc) renderCommandEncoderWithDescriptor:rp];
-		[r setRenderPipelineState:enc->ctx->present];
-		[r setFragmentTexture:src atIndex:0];
-		[r setFragmentSamplerState:enc->ctx->presentSampler atIndex:0];
-		[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-		[r endEncoding];
+		if (drawable.layer.displaySyncEnabled) {
+			drawPresent(cmd(enc), ctx, drawable, src);
+			double encodedAt = CACurrentMediaTime();
+			[cmd(enc) addCompletedHandler:^(id<MTLCommandBuffer> b) { gpuLatency += (CACurrentMediaTime() - encodedAt - gpuLatency) * 0.1; }];
+			[cmd(enc) presentDrawable:drawable];
+			return;
+		}
+		if (!ctx->presentQueue) {
+			ctx->presentQueue = [ctx->device newCommandQueue];
+			ctx->frameEvent = [ctx->device newSharedEvent];
+			ctx->presentEvent = [ctx->device newSharedEvent];
+		}
+		int slot = ctx->presentNext;
+		ctx->presentNext = (slot + 1) % 3;
+		id<MTLTexture> staging = ctx->presentStaging[slot];
+		if (!staging || staging.width != src.width || staging.height != src.height || staging.pixelFormat != src.pixelFormat) {
+			[staging release];  // a present still reading it keeps it alive: command buffers retain what they use
+			MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:src.width height:src.height mipmapped:NO];
+			d.usage = MTLTextureUsageShaderRead;
+			d.storageMode = MTLStorageModePrivate;
+			d.hazardTrackingMode = MTLHazardTrackingModeUntracked;  // ordered by frameEvent and presentEvent across the two queues
+			staging = ctx->presentStaging[slot] = [ctx->device newTextureWithDescriptor:d];
+			ctx->presentStagingRead[slot] = 0;
+		} else if (ctx->presentStagingRead[slot] > ctx->presentEvent.signaledValue) {
+			[cmd(enc) encodeWaitForEvent:ctx->presentEvent value:ctx->presentStagingRead[slot]];
+		}
+		[blit(enc) copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(src.width, src.height, 1)
+			toTexture:staging destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+		endBlit(enc);
+		[cmd(enc) encodeSignalEvent:ctx->frameEvent value:++ctx->frameValue];
+		// pacing's lead is the frame's encode-to-GPU-done time; the present command buffer can't be used for it, since it
+		// also waits for the display to release the drawable
 		double encodedAt = CACurrentMediaTime();
 		[cmd(enc) addCompletedHandler:^(id<MTLCommandBuffer> b) { gpuLatency += (CACurrentMediaTime() - encodedAt - gpuLatency) * 0.1; }];
-		[cmd(enc) presentDrawable:drawable];
+		[enc->presentDrawable release];  // a second present in one frame replaces the first
+		enc->presentDrawable = [drawable retain];
+		enc->presentSlot = slot;
+		enc->presentFrameValue = ctx->frameValue;
 	}
+}
+
+// Sends the present mc_present queued for this frame to the present queue, right after the frame's commit.
+static void presentQueued(Enc *enc) {
+	if (!enc->presentDrawable) return;
+	Ctx *ctx = enc->ctx;
+	int slot = enc->presentSlot;
+	@autoreleasepool {
+		id<MTLCommandBuffer> p = [ctx->presentQueue commandBuffer];
+		[p encodeWaitForEvent:ctx->frameEvent value:enc->presentFrameValue];
+		drawPresent(p, ctx, enc->presentDrawable, ctx->presentStaging[slot]);
+		ctx->presentStagingRead[slot] = ++ctx->presentValue;
+		[p encodeSignalEvent:ctx->presentEvent value:ctx->presentValue];
+		[p presentDrawable:enc->presentDrawable];
+		[p commit];
+	}
+	[enc->presentDrawable release];
+	enc->presentDrawable = nil;
 }
 
 // ---- MetalFX temporal upscaling ----
